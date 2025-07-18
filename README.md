@@ -1,4 +1,4 @@
-> [!INFO]
+> [!NOTE]
 > This repository fixes an issue in GE‑Proton where audio data isn’t decoded correctly in KONAMI’s PC rhythm games. Pre‑built Proton binaries are available for download on the Releases page.
 
 ## Prerequisites

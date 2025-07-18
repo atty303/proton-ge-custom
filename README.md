@@ -1,8 +1,12 @@
+<<<<<<< HEAD
 <<<<<<< ours
 > [!CAUTION]
 >  **MYSELF (GLORIOUSEGGROLL) AND THIS PROJECT (PROTON-GE) ARE NOT AFFILIATED WITH `hxxps[://]protonge[.]com`. THAT IS A SPAM/FAKE WEBSITE. THERE IS NO EXISTING WEBSITE FOR PROTON-GE OTHER THAN THIS GITHUB REPOSITORY. PROTON-GE DOES NOT COLLECT ANY USER DATA WHAT SO EVER AND IS NOT A COMPANY OR ORGANIZATION OF ANY TYPE.**
 =======
 > [!INFO]
+=======
+> [!NOTE]
+>>>>>>> 70bb56b5 (Update README.md)
 > This repository fixes an issue in GE‑Proton where audio data isn’t decoded correctly in KONAMI’s PC rhythm games. Pre‑built Proton binaries are available for download on the Releases page.
 >>>>>>> theirs
 

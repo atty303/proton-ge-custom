@@ -30,11 +30,20 @@ apply_all_in_dir() {
     git clean -xdf
     popd
 
+    pushd ffmpeg
+    git reset --hard HEAD
+    git clean -xdf
+    echo "FFMPEG: avcodec/wmadec: fix WMA gapless playback"
+    apply_patch "../patches/ffmpeg-19802d170a304f5853d92e01d0513b9e06897d61.patch"
+    popd
+
     pushd gstreamer
     git reset --hard HEAD
     git clean -xdf
     echo "GSTREAMER: fix for unclosable invisible wayland opengl windows in taskbar"
     apply_all_in_dir "../patches/gstreamer/"
+    echo "GSTREAMER: correction for WMA gapless playback"
+    apply_patch "../patches/gstreamer-fix-wma-gapless.patch"
     popd
 
     pushd protonfixes

@@ -1,0 +1,97 @@
+From 19802d170a304f5853d92e01d0513b9e06897d61 Mon Sep 17 00:00:00 2001
+From: bnnm <bananaman255@gmail.com>
+Date: Fri, 5 Oct 2018 19:39:26 +0200
+Subject: [PATCH] avcodec/wmadec: fix WMA gapless playback
+
+Fixes trac issue #7473.
+
+Removes encoder delay (skip samples) and writes remaining frame samples after EOF to get correct sample count.
+
+Output is now accurate vs players that use Microsoft's codecs (Windows Media Format Runtime).
+
+Tested vs encode>decode WMAv2 with MS's codecs and most sample rate/bit rate/channel/mode combinations in ASF/XWMA.
+WMAv1 appears to use the same delay, from FFmpeg samples.
+
+Signed-off-by: bnnm <bananaman255@gmail.com>
+---
+ libavcodec/wma.h        |  2 ++
+ libavcodec/wmadec.c     | 22 ++++++++++++++++++++--
+ tests/fate/wma.mak      |  8 ++++----
+ tests/ref/fate/flcl1905 |  3 +--
+ 4 files changed, 27 insertions(+), 8 deletions(-)
+
+diff --git a/libavcodec/wma.h b/libavcodec/wma.h
+index aea7ba28ab4c5..80e52687fddab 100644
+--- a/libavcodec/wma.h
++++ b/libavcodec/wma.h
+@@ -135,6 +135,8 @@ typedef struct WMACodecContext {
+     float lsp_pow_m_table2[(1 << LSP_POW_BITS)];
+     AVFloatDSPContext *fdsp;
+
++    int eof_done; /* decode flag to output remaining samples after EOF */
++
+ #ifdef TRACE
+     int frame_count;
+ #endif /* TRACE */
+diff --git a/libavcodec/wmadec.c b/libavcodec/wmadec.c
+index cc67244344436..9955aaa7d6163 100644
+--- a/libavcodec/wmadec.c
++++ b/libavcodec/wmadec.c
+@@ -135,6 +135,8 @@ static av_cold int wma_decode_init(AVCodecContext *avctx)
+
+     avctx->sample_fmt = AV_SAMPLE_FMT_FLTP;
+
++    avctx->internal->skip_samples = s->frame_len * 2;
++
+     return 0;
+ }
+
+@@ -829,7 +831,20 @@ static int wma_decode_superframe(AVCodecContext *avctx, void *data,
+     ff_tlog(avctx, "***decode_superframe:\n");
+
+     if (buf_size == 0) {
++        if (s->eof_done)
++            return 0;
++
++        frame->nb_samples = s->frame_len;
++        if ((ret = ff_get_buffer(avctx, frame, 0)) < 0)
++            return ret;
++
++        for (i = 0; i < s->avctx->channels; i++)
++            memcpy(frame->extended_data[i], &s->frame_out[i][0],
++                   frame->nb_samples * sizeof(s->frame_out[i][0]));
++
+         s->last_superframe_len = 0;
++        s->eof_done = 1;
++        *got_frame_ptr = 1;
+         return 0;
+     }
+     if (buf_size < avctx->block_align) {
+@@ -975,6 +990,9 @@ static av_cold void flush(AVCodecContext *avctx)
+
+     s->last_bitoffset      =
+     s->last_superframe_len = 0;
++
++    s->eof_done = 0;
++    avctx->internal->skip_samples = s->frame_len * 2;
+ }
+
+ #if CONFIG_WMAV1_DECODER
+@@ -988,7 +1006,7 @@ const AVCodec ff_wmav1_decoder = {
+     .close          = ff_wma_end,
+     .decode         = wma_decode_superframe,
+     .flush          = flush,
+-    .capabilities   = AV_CODEC_CAP_DR1,
++    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
+                                                       AV_SAMPLE_FMT_NONE },
+     .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,
+@@ -1005,7 +1023,7 @@ const AVCodec ff_wmav2_decoder = {
+     .close          = ff_wma_end,
+     .decode         = wma_decode_superframe,
+     .flush          = flush,
+-    .capabilities   = AV_CODEC_CAP_DR1,
++    .capabilities   = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
+     .sample_fmts    = (const enum AVSampleFormat[]) { AV_SAMPLE_FMT_FLTP,
+                                                       AV_SAMPLE_FMT_NONE },
+     .caps_internal  = FF_CODEC_CAP_INIT_THREADSAFE | FF_CODEC_CAP_INIT_CLEANUP,

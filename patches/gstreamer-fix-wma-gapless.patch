@@ -1,0 +1,102 @@
+diff --git a/subprojects/gst-libav/ext/libav/gstavauddec.c b/subprojects/gst-libav/ext/libav/gstavauddec.c
+index 597cb547bc..7a07e874ed 100644
+--- a/subprojects/gst-libav/ext/libav/gstavauddec.c
++++ b/subprojects/gst-libav/ext/libav/gstavauddec.c
+@@ -222,13 +222,6 @@ gst_ffmpegauddec_start (GstAudioDecoder * decoder)
+   }
+   ffmpegdec->context->opaque = ffmpegdec;
+
+-  /* FIXME: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/1474 */
+-  if ((oclass->in_plugin->capabilities & AV_CODEC_CAP_DELAY) != 0
+-      && (oclass->in_plugin->id == AV_CODEC_ID_WMAV1
+-          || oclass->in_plugin->id == AV_CODEC_ID_WMAV2)) {
+-    ffmpegdec->context->flags2 |= AV_CODEC_FLAG2_SKIP_MANUAL;
+-  }
+-
+   GST_OBJECT_UNLOCK (ffmpegdec);
+
+   return TRUE;
+@@ -617,14 +610,11 @@ gst_ffmpegauddec_drain (GstFFMpegAudDec * ffmpegdec, gboolean force)
+   if (avcodec_send_packet (ffmpegdec->context, NULL))
+     goto send_packet_failed;
+
+-  /* FIXME: https://gitlab.freedesktop.org/gstreamer/gstreamer/-/issues/1474 */
+-  if (!(ffmpegdec->context->flags2 & AV_CODEC_FLAG2_SKIP_MANUAL)) {
+-    do {
+-      got_frame = gst_ffmpegauddec_frame (ffmpegdec, &ret, &need_more_data);
+-      if (got_frame)
+-        got_any_frames = TRUE;
+-    } while (got_frame && !need_more_data);
+-  }
++  do {
++    got_frame = gst_ffmpegauddec_frame (ffmpegdec, &ret, &need_more_data);
++    if (got_frame)
++      got_any_frames = TRUE;
++  } while (got_frame && !need_more_data);
+   avcodec_flush_buffers (ffmpegdec->context);
+
+   /* FFMpeg will return AVERROR_EOF if it's internal was fully drained
+diff --git a/subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudiodecoder.c b/subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudiodecoder.c
+index 9396a9ff49..194ca6233a 100644
+--- a/subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudiodecoder.c
++++ b/subprojects/gst-plugins-base/gst-libs/gst/audio/gstaudiodecoder.c
+@@ -227,6 +227,9 @@ struct _GstAudioDecoderPrivate
+   /* number of samples pushed out via _finish_subframe(), resets on _finish_frame() */
+   guint subframe_samples;
+
++  /* last input buffer for metadata copy when frames queue is empty */
++  GstBuffer *last_input_buffer;
++
+   /* input bps estimatation */
+   /* global in bytes seen */
+   guint64 bytes_in;
+@@ -505,6 +508,7 @@ gst_audio_decoder_init (GstAudioDecoder * dec, GstAudioDecoderClass * klass)
+   /* init state */
+   dec->priv->ctx.min_latency = 0;
+   dec->priv->ctx.max_latency = 0;
++  dec->priv->last_input_buffer = NULL;
+   gst_audio_decoder_reset (dec, TRUE);
+   GST_DEBUG_OBJECT (dec, "init ok");
+ }
+@@ -526,6 +530,11 @@ gst_audio_decoder_reset (GstAudioDecoder * dec, gboolean full)
+     dec->priv->error_count = 0;
+     gst_audio_decoder_clear_queues (dec);
+
++    if (dec->priv->last_input_buffer) {
++      gst_buffer_unref (dec->priv->last_input_buffer);
++      dec->priv->last_input_buffer = NULL;
++    }
++
+     if (dec->priv->taglist) {
+       gst_tag_list_unref (dec->priv->taglist);
+       dec->priv->taglist = NULL;
+@@ -1431,12 +1440,15 @@ gst_audio_decoder_finish_frame_or_subframe (GstAudioDecoder * dec,
+   GST_DEBUG_OBJECT (dec, "leading frame ts %" GST_TIME_FORMAT,
+       GST_TIME_ARGS (ts));
+
+-  if (is_subframe && priv->frames.length == 0)
+-    goto subframe_without_pending_input_frame;
+
+   /* this will be skipped in the is_subframe case because frames will be 0 */
+   while (priv->frames.length && frames) {
+-    g_queue_push_tail (&inbufs, g_queue_pop_head (&priv->frames));
++    GstBuffer *input_buf = g_queue_pop_head (&priv->frames);
++    g_queue_push_tail (&inbufs, input_buf);
++    /* Update last input buffer reference */
++    if (priv->last_input_buffer)
++      gst_buffer_unref (priv->last_input_buffer);
++    priv->last_input_buffer = gst_buffer_ref (input_buf);
+     dec->priv->ctx.delay = dec->priv->frames.length;
+     frames--;
+   }
+@@ -1532,6 +1544,10 @@ gst_audio_decoder_finish_frame_or_subframe (GstAudioDecoder * dec,
+       /* For subframes we assume a 1:N relationship for now, so we just take
+        * metas from the first pending input buf */
+       in_buf = g_queue_peek_head (&priv->frames);
++      if (!in_buf) {
++        /* If no pending frames, use the last processed input buffer */
++        in_buf = priv->last_input_buffer;
++      }
+       data.decoder = dec;
+       data.outbuf = buf;
+       gst_buffer_foreach_meta (in_buf, foreach_metadata, &data);

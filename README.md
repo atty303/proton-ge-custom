@@ -69,6 +69,7 @@ The commit [19802d170a304f5853d92e01d0513b9e06897d61](https://github.com/FFmpeg/
 
 ### GStreamer
 
+<<<<<<< HEAD
 <<<<<<< ours
 - Additional media foundation patches for better video playback support
 - AMD FSR patches added directly to fullscreen hack that can be toggled with WINE_FULLSCREEN_FSR=1
@@ -82,6 +83,9 @@ The commit [19802d170a304f5853d92e01d0513b9e06897d61](https://github.com/FFmpeg/
 =======
 In MR !3117 ([https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge\_requests/3117](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/3117)), GStreamer’s libav plugin explicitly disables FFmpeg’s gapless handling by setting the `AV_CODEC_FLAG2_SKIP_MANUAL` flag on WMV decoders. This behavior remains in the latest GStreamer releases, meaning its libav plugin cannot perform true gapless playback.
 >>>>>>> theirs
+=======
+In MR !3117 ([https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge\_requests/3117](https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/3117)), GStreamer’s libav plugin explicitly disables FFmpeg’s gapless handling by setting the `AV_CODEC_FLAG2_SKIP_MANUAL` flag on WMA decoders. This behavior remains in the latest GStreamer releases, meaning its libav plugin cannot perform true gapless playback.
+>>>>>>> d48ec6c5 (Update README.md)
 
 #### Expected (non‑gapless) Behavior
 
@@ -421,7 +425,7 @@ Additionally, a thank you is owed to Andrew Aeikum (aeikum), and kisak (kisak-va
 Because there’s no input frame for `DelayFrame`, GStreamer throws an error. This is an architectural limitation in GStreamer.
 >>>>>>> theirs
 
-#### Fix
+### Fix
 
 Map `DelayFrame` back to the final Frame3 so no error occurs. The PTS can still be correct; in my use case it works perfectly. Whether this behavior is generally acceptable in GStreamer is unclear.
 

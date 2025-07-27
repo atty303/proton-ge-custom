@@ -435,6 +435,10 @@ Map `DelayFrame` back to the final Frame3 so no error occurs. The PTS can still 
 
 FFmpeg’s upstream `n5.0.0` includes this commit, but GE‑Proton currently references `n4.x`. Simply bumping the FFmpeg version breaks the build due to dependency changes outside our scope, so we apply only the WMA patch.
 
+### [`patches/ffmpeg-61c2c9ef8e66920c8ba308e8fa9f36ae602f8245.patch`](./patches/ffmpeg-61c2c9ef8e66920c8ba308e8fa9f36ae602f8245.patch)
+
+Similarly to the above, we will backport gapless support to the WMA9 Pro codec. SDVX uses this codec.
+
 ### [`patches/gstreamer-fix-wma-gapless.patch`](https://github.com/atty303/proton-ge-custom/blob/fix-wma-delay/patches/gstreamer-fix-wma-gapless.patch)
 
 * Remove the code that disables gapless support in GStreamer’s libav plugin.

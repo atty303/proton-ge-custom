@@ -1,0 +1,517 @@
+From a7f731a3533754f045e57a9ec4dde8a1fa47fea5 Mon Sep 17 00:00:00 2001
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 02:55:59 +0900
+Subject: [PATCH] winedmo: passively capture complete ASF inputs
+
+---
+ dlls/winedmo/main.c         |   1 +
+ dlls/winedmo/unix_demuxer.c | 403 ++++++++++++++++++++++++++++++++++++
+ dlls/winedmo/unix_private.h |   4 +
+ dlls/winedmo/unixlib.c      |   3 +
+ dlls/winedmo/unixlib.h      |   1 +
+ 5 files changed, 412 insertions(+)
+
+diff --git a/dlls/winedmo/main.c b/dlls/winedmo/main.c
+index f4ea143e67e..f1baa18a85a 100644
+--- a/dlls/winedmo/main.c
++++ b/dlls/winedmo/main.c
+@@ -72,6 +72,7 @@ static struct stream_context *stream_context_create( struct winedmo_stream *stre
+     context->position = 0;
+     context->capacity = BUFFER_SIZE;
+     context->size = 0;
++    context->capture = 0;
+ 
+     return context;
+ }
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+index 7c121942a6f..7c3a53084c2 100644
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -23,12 +23,71 @@
+ #include "config.h"
+ #include "unix_private.h"
+ 
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
+ #include "wine/debug.h"
+ 
+ #ifdef HAVE_FFMPEG
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
+ 
++#define INPUT_CAPTURE_MAX_FILE_SIZE (64ull * 1024 * 1024)
++#define INPUT_CAPTURE_MAX_TOTAL_SIZE (2ull * 1024 * 1024 * 1024)
++#define INPUT_CAPTURE_MAX_PENDING_SIZE (256ull * 1024 * 1024)
++
++struct input_capture_stream
++{
++    char codec[64];
++    UINT codec_id;
++    UINT codec_tag;
++    int sample_rate;
++    int channels;
++    int block_align;
++    INT64 bit_rate;
++    UINT stream_index;
++};
++
++struct input_capture
++{
++    struct input_capture *next;
++    char *dir;
++    BYTE *data;
++    BYTE *covered;
++    UINT64 capture_id;
++    UINT64 size;
++    INT64 duration;
++    UINT block_count;
++    UINT covered_count;
++    UINT stream_count;
++    BOOL identified;
++    BOOL complete;
++    BOOL reserved;
++    char error_type[32];
++    char format[64];
++    char extension[4];
++    struct input_capture_stream *streams;
++};
++
++static pthread_mutex_t input_capture_budget_mutex = PTHREAD_MUTEX_INITIALIZER;
++static UINT64 input_capture_reserved_bytes;
++static UINT64 input_capture_pending_bytes;
++static UINT64 input_capture_next_id;
++static pthread_mutex_t input_capture_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t input_capture_queue_cond = PTHREAD_COND_INITIALIZER;
++static pthread_t input_capture_thread;
++static BOOL input_capture_thread_started;
++static struct input_capture *input_capture_queue_head;
++static struct input_capture **input_capture_queue_tail = &input_capture_queue_head;
++
+ static inline const char *debugstr_averr( int err )
+ {
+     return wine_dbg_sprintf( "%d (%s)", err, av_err2str(err) );
+@@ -106,6 +165,347 @@ static BOOL read_stream_at( struct stream_context *context, UINT64 offset, BYTE
+     return ret == size;
+ }
+ 
++static void input_capture_sanitize( const char *input, char *output, size_t output_size )
++{
++    size_t i;
++
++    if (!output_size) return;
++    for (i = 0; input && input[i] && i + 1 < output_size; ++i)
++    {
++        char c = input[i];
++        output[i] = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
++                || (c >= '0' && c <= '9') ? c : '_';
++    }
++    if (!i) output[i++] = 'u';
++    output[i] = 0;
++}
++
++static BOOL input_capture_has_audio( const AVFormatContext *ctx )
++{
++    UINT i;
++
++    for (i = 0; i < ctx->nb_streams; ++i)
++        if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
++            return TRUE;
++    return FALSE;
++}
++
++static void input_capture_release_budget( struct input_capture *capture, BOOL release_total )
++{
++    if (!capture->reserved) return;
++    pthread_mutex_lock( &input_capture_budget_mutex );
++    input_capture_pending_bytes -= capture->size;
++    if (release_total) input_capture_reserved_bytes -= capture->size;
++    pthread_mutex_unlock( &input_capture_budget_mutex );
++    capture->reserved = FALSE;
++}
++
++static void input_capture_free( struct input_capture *capture )
++{
++    free( capture->streams );
++    free( capture->covered );
++    free( capture->data );
++    free( capture->dir );
++    free( capture );
++}
++
++static void input_capture_manifest( const struct input_capture *capture, const char *status,
++        const char *artifact, UINT64 hash )
++{
++    char *path;
++    int fd;
++    UINT i;
++
++    if (asprintf( &path, "%s/manifest.jsonl", capture->dir ) < 0) return;
++    if ((fd = open( path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600 )) < 0)
++    {
++        WARN( "Failed to open input capture manifest %s: %s.\n", debugstr_a(path), strerror(errno) );
++        free( path );
++        return;
++    }
++    free( path );
++
++    flock( fd, LOCK_EX );
++    for (i = 0; i < capture->stream_count; ++i)
++    {
++        const struct input_capture_stream *stream = capture->streams + i;
++        dprintf( fd, "{\"capture_id\":\"%d-%"PRIu64"\",\"status\":\"%s\","
++                "\"error_type\":\"%s\",\"artifact\":\"%s\",\"format\":\"%s\","
++                "\"stream_index\":%u,\"codec\":\"%s\",\"codec_id\":%u,\"codec_tag\":%u,"
++                "\"sample_rate\":%d,\"channels\":%d,\"block_align\":%d,\"bit_rate\":%"PRId64","
++                "\"duration_100ns\":%"PRId64",\"stream_bytes\":%"PRIu64","
++                "\"covered_blocks\":%u,\"total_blocks\":%u,\"fnv1a64\":\"%016"PRIx64"\"}\n",
++                getpid(), capture->capture_id, status, capture->error_type, artifact ? artifact : "",
++                capture->format, stream->stream_index, stream->codec, stream->codec_id, stream->codec_tag,
++                stream->sample_rate, stream->channels, stream->block_align, stream->bit_rate,
++                capture->duration, capture->size, capture->covered_count, capture->block_count, hash );
++    }
++    flock( fd, LOCK_UN );
++    close( fd );
++}
++
++static void input_capture_write( struct input_capture *capture )
++{
++    char codec[64], artifact[256];
++    char *temp_path = NULL, *final_path = NULL;
++    UINT64 hash = 14695981039346656037ull;
++    UINT64 offset;
++    int fd = -1;
++    ssize_t written;
++
++    if (mkdir( capture->dir, 0700 ) < 0 && errno != EEXIST)
++    {
++        WARN( "Failed to create input capture directory %s: %s.\n",
++                debugstr_a(capture->dir), strerror(errno) );
++        input_capture_release_budget( capture, TRUE );
++        return;
++    }
++    if (!capture->complete)
++    {
++        input_capture_manifest( capture, "partial", NULL, 0 );
++        input_capture_release_budget( capture, TRUE );
++        return;
++    }
++
++    for (offset = 0; offset < capture->size; ++offset)
++    {
++        hash ^= capture->data[offset];
++        hash *= 1099511628211ull;
++    }
++    input_capture_sanitize( capture->streams[0].codec, codec, sizeof(codec) );
++    snprintf( artifact, sizeof(artifact), "%s-%s-%016"PRIx64"-%"PRIu64".%s",
++            capture->format, codec, hash, capture->size, capture->extension );
++    if (asprintf( &final_path, "%s/%s", capture->dir, artifact ) < 0) goto failed;
++    if (!access( final_path, F_OK ))
++    {
++        input_capture_manifest( capture, "complete", artifact, hash );
++        input_capture_release_budget( capture, TRUE );
++        free( final_path );
++        return;
++    }
++    if (asprintf( &temp_path, "%s/.winedmo-input-XXXXXX", capture->dir ) < 0
++            || (fd = mkstemp( temp_path )) < 0)
++        goto failed;
++    fchmod( fd, 0600 );
++    for (offset = 0; offset < capture->size; offset += written)
++        if ((written = write( fd, capture->data + offset, capture->size - offset )) <= 0) goto failed;
++    if (close( fd ) < 0)
++    {
++        fd = -1;
++        goto failed;
++    }
++    fd = -1;
++    if (rename( temp_path, final_path ) < 0) goto failed;
++
++    input_capture_manifest( capture, "complete", artifact, hash );
++    input_capture_release_budget( capture, FALSE );
++    free( final_path );
++    free( temp_path );
++    return;
++
++failed:
++    WARN( "Passive input capture failed: %s. Decode will continue.\n", strerror(errno) );
++    if (fd >= 0) close( fd );
++    if (temp_path) unlink( temp_path );
++    snprintf( capture->error_type, sizeof(capture->error_type), "write_failed" );
++    input_capture_manifest( capture, "partial", NULL, hash );
++    input_capture_release_budget( capture, TRUE );
++    free( final_path );
++    free( temp_path );
++}
++
++static void *input_capture_worker( void *arg )
++{
++    struct input_capture *capture;
++
++    for (;;)
++    {
++        pthread_mutex_lock( &input_capture_queue_mutex );
++        while (!input_capture_queue_head)
++            pthread_cond_wait( &input_capture_queue_cond, &input_capture_queue_mutex );
++        capture = input_capture_queue_head;
++        if (!(input_capture_queue_head = capture->next))
++            input_capture_queue_tail = &input_capture_queue_head;
++        pthread_mutex_unlock( &input_capture_queue_mutex );
++
++        input_capture_write( capture );
++        input_capture_free( capture );
++    }
++    return NULL;
++}
++
++static void input_capture_enqueue( struct input_capture *capture )
++{
++    int ret = 0;
++
++    pthread_mutex_lock( &input_capture_queue_mutex );
++    if (!input_capture_thread_started)
++    {
++        if (!(ret = pthread_create( &input_capture_thread, NULL, input_capture_worker, NULL )))
++        {
++            pthread_detach( input_capture_thread );
++            input_capture_thread_started = TRUE;
++        }
++    }
++    if (!ret)
++    {
++        *input_capture_queue_tail = capture;
++        input_capture_queue_tail = &capture->next;
++        pthread_cond_signal( &input_capture_queue_cond );
++    }
++    pthread_mutex_unlock( &input_capture_queue_mutex );
++
++    if (ret)
++    {
++        WARN( "Failed to start passive input capture worker: %s.\n", strerror(ret) );
++        input_capture_release_budget( capture, TRUE );
++        input_capture_free( capture );
++    }
++}
++
++void input_capture_start( struct stream_context *context )
++{
++    const char *dir = getenv( "WINEDMO_ASF_DUMP_DIR" );
++    struct input_capture *capture;
++
++    if (!dir || !dir[0] || !context || context->capture || !context->length
++            || context->length == (UINT64)-1
++            || context->length > INPUT_CAPTURE_MAX_FILE_SIZE)
++        return;
++    if (!(capture = calloc( 1, sizeof(*capture) )) || !(capture->dir = strdup( dir ))) goto failed;
++    capture->size = context->length;
++    capture->block_count = (capture->size + context->capacity - 1) / context->capacity;
++
++    pthread_mutex_lock( &input_capture_budget_mutex );
++    if (capture->size <= INPUT_CAPTURE_MAX_TOTAL_SIZE - input_capture_reserved_bytes
++            && capture->size <= INPUT_CAPTURE_MAX_PENDING_SIZE - input_capture_pending_bytes)
++    {
++        input_capture_reserved_bytes += capture->size;
++        input_capture_pending_bytes += capture->size;
++        capture->capture_id = ++input_capture_next_id;
++        capture->reserved = TRUE;
++    }
++    pthread_mutex_unlock( &input_capture_budget_mutex );
++    if (!capture->reserved) goto failed;
++    if (!(capture->data = malloc( capture->size ))
++            || !(capture->covered = calloc( capture->block_count, sizeof(*capture->covered) )))
++        goto failed;
++
++    context->capture = (UINT_PTR)capture;
++    return;
++
++failed:
++    if (capture)
++    {
++        input_capture_release_budget( capture, TRUE );
++        input_capture_free( capture );
++    }
++}
++
++void input_capture_identify( struct stream_context *context, const AVFormatContext *ctx, INT64 duration )
++{
++    struct input_capture *capture;
++    UINT audio_count = 0, i, j;
++    BOOL has_video = FALSE;
++
++    if (!context || !(capture = (struct input_capture *)(UINT_PTR)context->capture)) return;
++    if (!ctx->iformat || !strstr( ctx->iformat->name, "asf" ) || !input_capture_has_audio( ctx ))
++    {
++        context->capture = 0;
++        input_capture_release_budget( capture, TRUE );
++        input_capture_free( capture );
++        return;
++    }
++
++    for (i = 0; i < ctx->nb_streams; ++i)
++    {
++        if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) ++audio_count;
++        if (ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) has_video = TRUE;
++    }
++    if (!(capture->streams = calloc( audio_count, sizeof(*capture->streams) )))
++    {
++        context->capture = 0;
++        input_capture_release_budget( capture, TRUE );
++        input_capture_free( capture );
++        return;
++    }
++
++    capture->duration = duration;
++    capture->stream_count = audio_count;
++    capture->identified = TRUE;
++    input_capture_sanitize( ctx->iformat->name, capture->format, sizeof(capture->format) );
++    strcpy( capture->extension, has_video ? "asf" : "wma" );
++    for (i = j = 0; i < ctx->nb_streams; ++i)
++    {
++        const AVCodecParameters *par = ctx->streams[i]->codecpar;
++        struct input_capture_stream *stream;
++
++        if (par->codec_type != AVMEDIA_TYPE_AUDIO) continue;
++        stream = capture->streams + j++;
++        snprintf( stream->codec, sizeof(stream->codec), "%s", avcodec_get_name( par->codec_id ) );
++        stream->codec_id = par->codec_id;
++        stream->codec_tag = par->codec_tag;
++        stream->sample_rate = par->sample_rate;
++#if LIBAVUTIL_VERSION_MAJOR >= 58
++        stream->channels = par->ch_layout.nb_channels;
++#else
++        stream->channels = par->channels;
++#endif
++        stream->block_align = par->block_align;
++        stream->bit_rate = par->bit_rate;
++        stream->stream_index = i;
++    }
++
++    if (capture->covered_count == capture->block_count)
++    {
++        context->capture = 0;
++        capture->complete = TRUE;
++        input_capture_enqueue( capture );
++    }
++}
++
++void input_capture_buffer( struct stream_context *context, UINT64 offset, const BYTE *buffer, UINT32 size )
++{
++    struct input_capture *capture;
++    UINT64 expected;
++    UINT block;
++
++    if (!context || !(capture = (struct input_capture *)(UINT_PTR)context->capture)
++            || offset >= capture->size || offset % context->capacity)
++        return;
++    block = offset / context->capacity;
++    if (block >= capture->block_count || capture->covered[block]) return;
++    expected = min( capture->size - offset, (UINT64)context->capacity );
++    size = min( (UINT64)size, expected );
++    memcpy( capture->data + offset, buffer, size );
++    if (size != expected) return;
++    capture->covered[block] = TRUE;
++    ++capture->covered_count;
++
++    if (capture->identified && capture->covered_count == capture->block_count)
++    {
++        context->capture = 0;
++        capture->complete = TRUE;
++        input_capture_enqueue( capture );
++    }
++}
++
++void input_capture_finish( struct stream_context *context )
++{
++    struct input_capture *capture;
++
++    if (!context || !(capture = (struct input_capture *)(UINT_PTR)context->capture)) return;
++    context->capture = 0;
++    if (!capture->identified)
++    {
++        input_capture_release_budget( capture, TRUE );
++        input_capture_free( capture );
++        return;
++    }
++    snprintf( capture->error_type, sizeof(capture->error_type), "coverage_incomplete" );
++    input_capture_enqueue( capture );
++}
++
+ static INT64 get_asf_header_duration( AVFormatContext *ctx )
+ {
+     static const BYTE asf_header_guid[16] =
+@@ -769,6 +1169,7 @@ static BOOL is_http_hls_url( const char *url )
+ 
+ static void demuxer_free_context( struct demuxer *demuxer )
+ {
++    if (!demuxer->direct_url) input_capture_finish( demuxer->stream_context );
+     if (!demuxer->ctx) return;
+ 
+     if (demuxer->direct_url) avformat_close_input( &demuxer->ctx );
+@@ -818,6 +1219,7 @@ NTSTATUS demuxer_create( void *arg )
+     }
+     else
+     {
++        input_capture_start( params->context );
+         if (!(demuxer->ctx->pb = avio_alloc_context( NULL, 0, 0, params->context, unix_read_callback, NULL,
+                                                      params->context->length == (UINT64)-1 ? NULL : unix_seek_callback ))) goto failed;
+ 
+@@ -842,6 +1244,7 @@ NTSTATUS demuxer_create( void *arg )
+         params->duration = get_context_duration( demuxer->ctx );
+     }
+     demuxer->duration = params->duration;
++    if (!demuxer->direct_url) input_capture_identify( params->context, demuxer->ctx, params->duration );
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+ 
+diff --git a/dlls/winedmo/unix_private.h b/dlls/winedmo/unix_private.h
+index 8dee70b924c..b0b09088430 100644
+--- a/dlls/winedmo/unix_private.h
++++ b/dlls/winedmo/unix_private.h
+@@ -69,6 +69,10 @@ extern const WineFFBitStreamFilter ff_pcm_byte_order_reverse_bsf;
+ /* unixlib.c */
+ extern int64_t unix_seek_callback( void *opaque, int64_t offset, int whence );
+ extern int unix_read_callback( void *opaque, uint8_t *buffer, int size );
++extern void input_capture_start( struct stream_context *context );
++extern void input_capture_identify( struct stream_context *context, const AVFormatContext *ctx, INT64 duration );
++extern void input_capture_buffer( struct stream_context *context, UINT64 offset, const BYTE *buffer, UINT32 size );
++extern void input_capture_finish( struct stream_context *context );
+ 
+ /* unix_demuxer.c */
+ extern NTSTATUS demuxer_check( void * );
+diff --git a/dlls/winedmo/unixlib.c b/dlls/winedmo/unixlib.c
+index 29dfba72c90..c45f3b1a880 100644
+--- a/dlls/winedmo/unixlib.c
++++ b/dlls/winedmo/unixlib.c
+@@ -76,6 +76,9 @@ static int stream_context_read( struct stream_context *context )
+     status = KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
+     if (status || ret_len != sizeof(ULONG)) return AVERROR( EINVAL );
+     context->size = *(ULONG *)ret_ptr;
++    if (context->size)
++        input_capture_buffer( context, (context->position / context->capacity) * context->capacity,
++                              context->buffer, context->size );
+     return 0;
+ }
+ 
+diff --git a/dlls/winedmo/unixlib.h b/dlls/winedmo/unixlib.h
+index b2b6a30fbb1..7fa1aabb3c7 100644
+--- a/dlls/winedmo/unixlib.h
++++ b/dlls/winedmo/unixlib.h
+@@ -46,6 +46,7 @@ struct stream_context
+ 
+     UINT32 capacity; /* total allocated capacity for the buffer */
+     UINT32 size; /* current data size in the buffer */
++    UINT64 capture; /* unix-side passive input capture */
+     BYTE buffer[];
+ };
+ 
+-- 
+2.55.0
+

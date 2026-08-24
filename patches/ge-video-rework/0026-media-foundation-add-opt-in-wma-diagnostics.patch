@@ -1,0 +1,435 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 04:10:00 +0900
+Subject: [PATCH] media foundation: add opt-in WMA diagnostics
+
+---
+diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -25,6 +25,7 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
+ 
+ #define FIRST_USER_QUEUE_HANDLE 5
+ #define MAX_USER_QUEUE_HANDLES 2048
+@@ -56,6 +57,10 @@
+ static struct queue_handle *next_unused_user_queue = user_queues;
+ static WORD queue_generation;
+ static DWORD shared_mt_queue;
++static unsigned int active_user_queue_count;
++static unsigned int high_water_user_queue_count;
++static unsigned int total_user_queue_allocations;
++static unsigned int failed_user_queue_allocations;
+ 
+ static CRITICAL_SECTION queues_section;
+ static CRITICAL_SECTION_DEBUG queues_critsect_debug =
+@@ -206,6 +211,8 @@
+ {
+     HRESULT hr = RTWQ_E_INVALID_WORKQUEUE;
+     struct queue_handle *entry;
++    LONG refcount = 0;
++    unsigned int active;
+ 
+     if (!(queue & RTWQ_CALLBACK_QUEUE_PRIVATE_MASK))
+         return S_OK;
+@@ -214,10 +221,13 @@
+     entry = get_queue_obj(queue);
+     if (entry && entry->refcount)
+     {
+-        entry->refcount++;
++        refcount = ++entry->refcount;
+         hr = S_OK;
+     }
++    active = active_user_queue_count;
+     LeaveCriticalSection(&queues_section);
++    TRACE_(wmadiag)("event=queue_ref action=lock handle=%#lx refcount=%ld active=%u status=%#lx\n",
++            queue, refcount, active, hr);
+     return hr;
+ }
+ 
+@@ -226,6 +236,8 @@
+     HRESULT hr = RTWQ_E_INVALID_WORKQUEUE;
+     struct queue *queue_obj = NULL;
+     struct queue_handle *entry;
++    LONG refcount = 0;
++    unsigned int active;
+ 
+     if (!(queue & RTWQ_CALLBACK_QUEUE_PRIVATE_MASK))
+         return S_OK;
+@@ -234,17 +246,22 @@
+     entry = get_queue_obj(queue);
+     if (entry && entry->refcount)
+     {
+-        if (--entry->refcount == 0)
++        if (!(refcount = --entry->refcount))
+         {
+             if (shared_mt_queue == queue) shared_mt_queue = 0;
+             queue_obj = entry->obj;
+             entry->obj = next_free_user_queue;
+             next_free_user_queue = entry;
++            --active_user_queue_count;
+         }
+         hr = S_OK;
+     }
++    active = active_user_queue_count;
+     LeaveCriticalSection(&queues_section);
+ 
++    TRACE_(wmadiag)("event=queue_ref action=%s handle=%#lx refcount=%ld active=%u status=%#lx\n",
++            queue_obj ? "free" : "unlock", queue, refcount, active, hr);
++
+     if (queue_obj)
+     {
+         shutdown_queue(queue_obj);
+@@ -974,7 +991,8 @@
+ {
+     struct queue_handle *entry;
+     struct queue *queue;
+-    unsigned int idx;
++    unsigned int active, failures, high_water, idx, total;
++    BOOL reused;
+ 
+     *queue_id = RTWQ_CALLBACK_QUEUE_UNDEFINED;
+ 
+@@ -990,13 +1008,26 @@
+ 
+     entry = next_free_user_queue;
+     if (entry)
++    {
+         next_free_user_queue = entry->obj;
++        reused = TRUE;
++    }
+     else if (next_unused_user_queue < user_queues + MAX_USER_QUEUE_HANDLES)
++    {
+         entry = next_unused_user_queue++;
++        reused = FALSE;
++    }
+     else
+     {
++        failures = ++failed_user_queue_allocations;
++        active = active_user_queue_count;
++        high_water = high_water_user_queue_count;
++        total = total_user_queue_allocations;
+         LeaveCriticalSection(&queues_section);
+         free(queue);
++        TRACE_(wmadiag)("event=queue_allocate status=exhausted queue_type=%u target=%#lx active=%u"
++                " high_water=%u total=%u failures=%u limit=%u\n", desc->queue_type, desc->target_queue,
++                active, high_water, total, failures, MAX_USER_QUEUE_HANDLES);
+         WARN("Out of user queue handles.\n");
+         return E_OUTOFMEMORY;
+     }
+@@ -1007,9 +1038,21 @@
+     entry->generation = queue_generation;
+     idx = entry - user_queues + FIRST_USER_QUEUE_HANDLE;
+     *queue_id = (idx << 16) | entry->generation;
++    ++active_user_queue_count;
++    if (active_user_queue_count > high_water_user_queue_count)
++        high_water_user_queue_count = active_user_queue_count;
++    ++total_user_queue_allocations;
++    active = active_user_queue_count;
++    high_water = high_water_user_queue_count;
++    total = total_user_queue_allocations;
+ 
+     LeaveCriticalSection(&queues_section);
+ 
++    TRACE_(wmadiag)("event=queue_allocate status=success handle=%#lx queue_type=%u target=%#lx slot=%s"
++            " active=%u high_water=%u total=%u limit=%u\n", *queue_id, desc->queue_type,
++            desc->target_queue, reused ? "reused" : "new", active, high_water, total,
++            MAX_USER_QUEUE_HANDLES);
++
+     return S_OK;
+ }
+ 
+@@ -1324,11 +1367,21 @@
+ 
+ HRESULT WINAPI RtwqShutdown(void)
+ {
++    unsigned int active, failures, high_water, total;
++
+     if (startup_count <= 0)
+         return S_OK;
+ 
+     if (InterlockedExchangeAdd(&startup_count, -1) == 1)
+     {
++        EnterCriticalSection(&queues_section);
++        active = active_user_queue_count;
++        high_water = high_water_user_queue_count;
++        total = total_user_queue_allocations;
++        failures = failed_user_queue_allocations;
++        LeaveCriticalSection(&queues_section);
++        TRACE_(wmadiag)("event=queue_summary status=complete active=%u high_water=%u total=%u failures=%u limit=%u\n",
++                active, high_water, total, failures, MAX_USER_QUEUE_HANDLES);
+         shutdown_system_queues();
+         async_result_cache_clear();
+         RtwqUnlockPlatform();
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -40,6 +40,7 @@
+ #include "mf_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
+ 
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_ABGR32, D3DFMT_A8B8G8R8);
+ 
+@@ -298,7 +299,10 @@
+         if (reader->attributes)
+             IMFAttributes_Release(reader->attributes);
+         if (reader->queue)
++        {
++            TRACE_(wmadiag)("event=source_reader_destroy source=%p queue=%#lx\n", reader->source, reader->queue);
+             MFUnlockWorkQueue(reader->queue);
++        }
+         IMFMediaSource_Release(reader->source);
+ 
+         for (i = 0; i < reader->stream_count; ++i)
+@@ -3692,10 +3696,28 @@
+     return has_windows_media_audio && has_windows_media_video;
+ }
+ 
++static void source_reader_trace_streams(const struct source_reader *reader)
++{
++    unsigned int i;
++
++    if (!WINE_TRACE_ON(wmadiag)) return;
++
++    for (i = 0; i < reader->stream_count; ++i)
++    {
++        GUID major = GUID_NULL, subtype = GUID_NULL;
++
++        IMFMediaType_GetGUID(reader->streams[i].current, &MF_MT_MAJOR_TYPE, &major);
++        IMFMediaType_GetGUID(reader->streams[i].current, &MF_MT_SUBTYPE, &subtype);
++        TRACE_(wmadiag)("event=source_reader_stream source=%p stream=%u major=%s subtype=%s\n",
++                reader->source, i, debugstr_guid(&major), debugstr_guid(&subtype));
++    }
++}
++
+ static HRESULT create_source_reader_from_source(IMFMediaSource *source, IMFAttributes *attributes,
+         BOOL shutdown_on_release, REFIID riid, void **out)
+ {
+     struct source_reader *object;
++    BOOL windows_media_av;
+     unsigned int i;
+     HRESULT hr;
+ 
+@@ -3779,6 +3801,7 @@
+     /* At least one major type has to be set. */
+     object->first_audio_stream_index = reader_get_first_stream_index(object->descriptor, &MFMediaType_Audio);
+     object->first_video_stream_index = reader_get_first_stream_index(object->descriptor, &MFMediaType_Video);
++    source_reader_trace_streams(object);
+ 
+     if (object->first_audio_stream_index == MF_SOURCE_READER_INVALID_STREAM_INDEX &&
+             object->first_video_stream_index == MF_SOURCE_READER_INVALID_STREAM_INDEX)
+@@ -3786,7 +3809,8 @@
+         hr = MF_E_ATTRIBUTENOTFOUND;
+     }
+ 
+-    if (source_reader_has_windows_media_av_streams(object))
++    windows_media_av = source_reader_has_windows_media_av_streams(object);
++    if (windows_media_av)
+     {
+         /* Some Windows Media A/V callers keep reading each selected stream until
+          * every selected stream reports EOS, instead of stopping on a single
+@@ -3808,6 +3832,9 @@
+         goto failed;
+     }
+ 
++    TRACE_(wmadiag)("event=source_reader_queue source=%p policy=%s queue=%#lx streams=%lu\n",
++            object->source, windows_media_av ? "shared" : "serial", object->queue, object->stream_count);
++
+     if (FAILED(hr = IMFMediaSource_BeginGetEvent(object->source, &object->source_events_callback,
+             (IUnknown *)object->source)))
+     {
+diff --git a/dlls/winedmo/media_source.c b/dlls/winedmo/media_source.c
+--- a/dlls/winedmo/media_source.c
++++ b/dlls/winedmo/media_source.c
+@@ -31,6 +31,7 @@
+ #include "wine/list.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
+ 
+ /* ========================================================================
+  * object_context — carries state through async BeginCreateObject
+@@ -2140,6 +2141,8 @@
+ 
+     LeaveCriticalSection(&source->cs);
+ 
++    TRACE_(wmadiag)("event=media_source_queue action=free source=%p queue=%#lx\n",
++            source, source->async_commands_queue);
+     MFUnlockWorkQueue(source->async_commands_queue);
+ 
+     return S_OK;
+@@ -2222,6 +2225,8 @@
+ 
+     if (FAILED(hr = MFAllocateWorkQueue(&object->async_commands_queue)))
+         goto fail;
++    TRACE_(wmadiag)("event=media_source_queue action=allocate source=%p queue=%#lx\n",
++            object, object->async_commands_queue);
+ 
+     /* Set up winedmo stream callbacks. */
+     object->demuxer_stream.stream.p_seek = source_stream_seek_cb;
+@@ -2339,7 +2344,11 @@
+         CloseHandle(object->demux_thread);
+     }
+     if (object->async_commands_queue)
++    {
++        TRACE_(wmadiag)("event=media_source_queue action=free_failed_create source=%p queue=%#lx\n",
++                object, object->async_commands_queue);
+         MFUnlockWorkQueue(object->async_commands_queue);
++    }
+     if (object->event_queue)
+         IMFMediaEventQueue_Release(object->event_queue);
+     IMFByteStream_Release(object->byte_stream);
+diff --git a/dlls/winedmo/unix_demuxer.c b/dlls/winedmo/unix_demuxer.c
+--- a/dlls/winedmo/unix_demuxer.c
++++ b/dlls/winedmo/unix_demuxer.c
+@@ -39,6 +39,7 @@
+ #ifdef HAVE_FFMPEG
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(dmo);
++WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
+ 
+ #define INPUT_CAPTURE_MAX_FILE_SIZE (64ull * 1024 * 1024)
+ #define INPUT_CAPTURE_MAX_TOTAL_SIZE (2ull * 1024 * 1024 * 1024)
+@@ -190,6 +191,34 @@
+     return FALSE;
+ }
+ 
++static void input_capture_trace_demuxer( const AVFormatContext *ctx, const struct stream_context *context,
++        INT64 duration )
++{
++    UINT i;
++
++    if (!WINE_TRACE_ON(wmadiag)) return;
++
++    TRACE_(wmadiag)( "event=demuxer status=identified format=%s length=%"PRIu64" duration_100ns=%"PRId64
++            " streams=%u\n", ctx->iformat ? ctx->iformat->name : "unknown",
++            context ? context->length : (UINT64)-1, duration, ctx->nb_streams );
++    for (i = 0; i < ctx->nb_streams; ++i)
++    {
++        const AVCodecParameters *par = ctx->streams[i]->codecpar;
++        const char *media_type = av_get_media_type_string( par->codec_type );
++
++        TRACE_(wmadiag)( "event=demuxer_stream stream=%u media_type=%s codec=%s codec_id=%u codec_tag=%u"
++                " sample_rate=%d channels=%d bit_rate=%"PRId64"\n", i,
++                media_type ? media_type : "unknown", avcodec_get_name( par->codec_id ), par->codec_id,
++                par->codec_tag, par->sample_rate,
++#if LIBAVUTIL_VERSION_MAJOR >= 58
++                par->ch_layout.nb_channels,
++#else
++                par->channels,
++#endif
++                par->bit_rate );
++    }
++}
++
+ static void input_capture_release_budget( struct input_capture *capture, BOOL release_total )
+ {
+     if (!capture->reserved) return;
+@@ -366,12 +395,35 @@
+ void input_capture_start( struct stream_context *context )
+ {
+     const char *dir = getenv( "WINEDMO_ASF_DUMP_DIR" );
+-    struct input_capture *capture;
++    struct input_capture *capture = NULL;
++    const char *failure_reason = "allocation_failed";
+ 
+-    if (!dir || !dir[0] || !context || context->capture || !context->length
+-            || context->length == (UINT64)-1
+-            || context->length > INPUT_CAPTURE_MAX_FILE_SIZE)
++    if (!dir || !dir[0])
++    {
++        TRACE_(wmadiag)( "event=capture status=disabled reason=environment_unset\n" );
+         return;
++    }
++    if (!context || context->capture)
++    {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=invalid_context\n" );
++        return;
++    }
++    if (!context->length)
++    {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=zero_length\n" );
++        return;
++    }
++    if (context->length == (UINT64)-1)
++    {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=unknown_length\n" );
++        return;
++    }
++    if (context->length > INPUT_CAPTURE_MAX_FILE_SIZE)
++    {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=file_size_limit length=%"PRIu64" limit=%"PRIu64"\n",
++                context->length, (UINT64)INPUT_CAPTURE_MAX_FILE_SIZE );
++        return;
++    }
+     if (!(capture = calloc( 1, sizeof(*capture) )) || !(capture->dir = strdup( dir ))) goto failed;
+     capture->size = context->length;
+     capture->block_count = (capture->size + context->capacity - 1) / context->capacity;
+@@ -386,15 +438,23 @@
+         capture->reserved = TRUE;
+     }
+     pthread_mutex_unlock( &input_capture_budget_mutex );
+-    if (!capture->reserved) goto failed;
++    if (!capture->reserved)
++    {
++        failure_reason = "budget_limit";
++        goto failed;
++    }
+     if (!(capture->data = malloc( capture->size ))
+             || !(capture->covered = calloc( capture->block_count, sizeof(*capture->covered) )))
+         goto failed;
+ 
+     context->capture = (UINT_PTR)capture;
++    TRACE_(wmadiag)( "event=capture status=started capture_id=%"PRIu64" length=%"PRIu64" blocks=%u\n",
++            capture->capture_id, capture->size, capture->block_count );
+     return;
+ 
+ failed:
++    TRACE_(wmadiag)( "event=capture status=skipped reason=%s length=%"PRIu64"\n", failure_reason,
++            context ? context->length : 0 );
+     if (capture)
+     {
+         input_capture_release_budget( capture, TRUE );
+@@ -411,6 +471,9 @@
+     if (!context || !(capture = (struct input_capture *)(UINT_PTR)context->capture)) return;
+     if (!ctx->iformat || !strstr( ctx->iformat->name, "asf" ) || !input_capture_has_audio( ctx ))
+     {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=%s capture_id=%"PRIu64" format=%s\n",
++                !ctx->iformat || !strstr( ctx->iformat->name, "asf" ) ? "non_asf" : "no_audio",
++                capture->capture_id, ctx->iformat ? ctx->iformat->name : "unknown" );
+         context->capture = 0;
+         input_capture_release_budget( capture, TRUE );
+         input_capture_free( capture );
+@@ -424,6 +487,8 @@
+     }
+     if (!(capture->streams = calloc( audio_count, sizeof(*capture->streams) )))
+     {
++        TRACE_(wmadiag)( "event=capture status=skipped reason=stream_metadata_allocation_failed"
++                " capture_id=%"PRIu64"\n", capture->capture_id );
+         context->capture = 0;
+         input_capture_release_budget( capture, TRUE );
+         input_capture_free( capture );
+@@ -456,6 +521,9 @@
+         stream->stream_index = i;
+     }
+ 
++    TRACE_(wmadiag)( "event=capture status=eligible capture_id=%"PRIu64" format=%s audio_streams=%u"
++            " length=%"PRIu64"\n", capture->capture_id, capture->format, capture->stream_count, capture->size );
++
+     if (capture->covered_count == capture->block_count)
+     {
+         context->capture = 0;
+@@ -1244,6 +1312,7 @@
+         params->duration = get_context_duration( demuxer->ctx );
+     }
+     demuxer->duration = params->duration;
++    input_capture_trace_demuxer( demuxer->ctx, params->context, params->duration );
+     if (!demuxer->direct_url) input_capture_identify( params->context, demuxer->ctx, params->duration );
+     if (!(demuxer->streams = calloc( demuxer->ctx->nb_streams, sizeof(*demuxer->streams) ))) goto failed;
+     if (demuxer_create_streams( demuxer )) goto failed;
+-- 
+2.55.0

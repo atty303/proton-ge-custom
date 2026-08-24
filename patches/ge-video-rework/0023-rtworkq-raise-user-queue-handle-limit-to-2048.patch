@@ -1,7 +1,7 @@
 From f4275389ee8227c2b3db428d9c4804784397ab47 Mon Sep 17 00:00:00 2001
 From: atty303 <atty303@users.noreply.github.com>
 Date: Tue, 25 Aug 2026 02:55:59 +0900
-Subject: [PATCH] rtworkq: raise user queue handle limit to 1024
+Subject: [PATCH] rtworkq: raise user queue handle limit to 2048
 
 ---
  dlls/rtworkq/queue.c | 2 +-
@@ -16,10 +16,9 @@ index 5e28171b8c4..3c116a238ac 100644
  
  #define FIRST_USER_QUEUE_HANDLE 5
 -#define MAX_USER_QUEUE_HANDLES 124
-+#define MAX_USER_QUEUE_HANDLES 1024
++#define MAX_USER_QUEUE_HANDLES 2048
  
  #define WAIT_ITEM_KEY_MASK      (0x82000000)
  #define SCHEDULED_ITEM_KEY_MASK (0x80000000)
 -- 
 2.55.0
-

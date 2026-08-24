@@ -74,9 +74,9 @@ The experiment is bounded to 64 MiB per ASF, 256 MiB queued in memory, and 2 GiB
 Files and the manifest are created with user-only permissions. Treat the output as private game data
 and keep it outside the repository.
 
-The fixture-capture build intentionally contains only the 1024 RT work-queue handle limit, the 90-second
-WinHTTP response timeout, and this passive recorder. It contains no experimental decoder or EOS/drain
-change. Leaving `WINEDMO_ASF_DUMP_DIR` unset disables the recorder completely.
+The fixture-capture build intentionally contains only the 2048 RT work-queue handle limit, the 90-second
+WinHTTP response timeout, this passive recorder, and opt-in diagnostic logging. It contains no experimental
+decoder or EOS/drain change. Leaving `WINEDMO_ASF_DUMP_DIR` unset disables the recorder completely.
 
 For the known Konamate launch path, create a private directory outside this repository and export the
 variable for the launched Proton process:
@@ -89,3 +89,26 @@ WINEDMO_ASF_DUMP_DIR="$HOME/infinitas-wma-fixtures" ./dist/konamate-x86_64-unkno
 After the song has loaded, wait for `manifest.jsonl` to contain a `complete` record before stopping the
 process. Only the artifact named by that record is a usable fixture. A `partial` record is diagnostic
 evidence and must not be used as an ASF input.
+
+## Queue and media diagnostics
+
+The measurement build adds a dedicated `wmadiag` Wine debug channel. It is disabled during normal use.
+Enable it together with `PROTON_LOG` to record RT work-queue allocation, reuse, release, high-water and
+exhaustion events; Source Reader stream media types and queue policy; demuxer container and codec metadata;
+and passive-capture eligibility or skip reasons. The diagnostic events do not include the game asset path
+or encoded audio content.
+
+```text
+PROTON_LOG=1 WINEDEBUG=+wmadiag WINEDMO_ASF_DUMP_DIR="$HOME/infinitas-wma-fixtures" ./dist/konamate-x86_64-unknown-linux-gnu run infinitas --profile gamescope
+```
+
+`event=queue_summary status=complete` is the normal-run completion marker. If the process crashes or the
+marker is absent, treat the queue recording as partial. `event=queue_allocate status=exhausted` is direct
+evidence that the 2048 limit was reached. Compare `active`, `high_water`, `total`, `slot`, and the paired
+`media_source_queue` / `source_reader_queue` / `source_reader_destroy` events to distinguish a high
+concurrency peak from successful handle reuse.
+
+For a song that produces no artifact, inspect `event=demuxer`, `event=demuxer_stream`,
+`event=source_reader_stream`, and `event=capture status=skipped`. A Source Reader event without a matching
+winedmo demuxer event indicates that the media was handled outside this demuxer path; no corresponding
+Source Reader event indicates that this Media Foundation path was not reached during the recorded window.

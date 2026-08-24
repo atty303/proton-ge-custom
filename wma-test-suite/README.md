@@ -105,10 +105,24 @@ PROTON_LOG=1 WINEDEBUG=+wmadiag WINEDMO_ASF_DUMP_DIR="$HOME/infinitas-wma-fixtur
 `event=queue_summary status=complete` is the normal-run completion marker. If the process crashes or the
 marker is absent, treat the queue recording as partial. `event=queue_allocate status=exhausted` is direct
 evidence that the 2048 limit was reached. Compare `active`, `high_water`, `total`, `slot`, and the paired
-`media_source_queue` / `source_reader_queue` / `source_reader_destroy` events to distinguish a high
+`media_source_queue` / `source_reader_queue` / `source_reader_lifetime action=destroy` events to distinguish a high
 concurrency peak from successful handle reuse.
+
+`event=source_reader_lifetime` correlates one Source Reader by `reader` and reports its public COM reference
+count separately from the internal owner, source-event, stream-event, and async-command reference counts.
+The low-volume lifecycle actions are `create`, public `addref` / `release`, `end_of_presentation`,
+`shutdown_begin`, `shutdown_complete`, and `destroy`. If no public `release` reaches `public=0`, the caller
+still owns the reader. If `shutdown_complete` is present without `destroy`, the nonzero internal scope in
+that event identifies which Wine callback path is retaining it.
 
 For a song that produces no artifact, inspect `event=demuxer`, `event=demuxer_stream`,
 `event=source_reader_stream`, and `event=capture status=skipped`. A Source Reader event without a matching
 winedmo demuxer event indicates that the media was handled outside this demuxer path; no corresponding
 Source Reader event indicates that this Media Foundation path was not reached during the recorded window.
+
+### Known MSACM path
+
+Not every INFINITAS song uses WMA for its playable audio. One measured song opened 1,218 Microsoft ADPCM
+streams through MSACM and converted them to 44.1 kHz signed 16-bit PCM with Wine's `msacm.msadpcm`
+driver. In that run, all 14 Media Foundation Source Readers exposed H.264 video, and no input reached the
+`winedmo` ASF recorder; consequently, the measured song produced no passive ASF fixture.

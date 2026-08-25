@@ -1,0 +1,184 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 11:10:00 +0900
+Subject: [PATCH] mfreadwrite: add Source Reader lifetime diagnostics
+
+---
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -178,6 +178,10 @@ struct source_reader
+     IMFAsyncCallback async_commands_callback;
+     LONG refcount;
+     LONG public_refcount;
++    LONG owner_refcount;
++    LONG source_events_refcount;
++    LONG stream_events_refcount;
++    LONG async_commands_refcount;
+     IMFMediaSource *source;
+     IMFPresentationDescriptor *descriptor;
+     IMFSourceReaderCallback *async_callback;
+@@ -236,9 +240,32 @@ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+ static HRESULT source_reader_flush_transform_samples(struct source_reader *reader, struct media_stream *stream,
+         struct transform_entry *entry);
+ 
+-static ULONG source_reader_addref(struct source_reader *reader)
++static LONG source_reader_read_refcount(LONG *refcount)
+ {
+-    return InterlockedIncrement(&reader->refcount);
++    return InterlockedCompareExchange(refcount, 0, 0);
++}
++
++static void source_reader_trace_lifetime(struct source_reader *reader, const char *action, const char *scope)
++{
++    if (!WINE_TRACE_ON(wmadiag)) return;
++
++    TRACE_(wmadiag)("event=source_reader_lifetime action=%s scope=%s reader=%p source=%p queue=%#lx"
++            " public=%ld internal=%ld owner=%ld source_events=%ld stream_events=%ld async_commands=%ld\n",
++            action, scope, reader, reader->source, reader->queue,
++            source_reader_read_refcount(&reader->public_refcount),
++            source_reader_read_refcount(&reader->refcount),
++            source_reader_read_refcount(&reader->owner_refcount),
++            source_reader_read_refcount(&reader->source_events_refcount),
++            source_reader_read_refcount(&reader->stream_events_refcount),
++            source_reader_read_refcount(&reader->async_commands_refcount));
++}
++
++static ULONG source_reader_addref(struct source_reader *reader, LONG *scope_refcount)
++{
++    ULONG refcount = InterlockedIncrement(&reader->refcount);
++
++    if (WINE_TRACE_ON(wmadiag)) InterlockedIncrement(scope_refcount);
++    return refcount;
+ }
+ 
+ static void transform_entry_destroy(struct transform_entry *entry)
+@@ -283,13 +310,17 @@ static void media_stream_destroy(struct media_stream *stream)
+         IMFMediaType_Release(stream->current);
+ }
+ 
+-static ULONG source_reader_release(struct source_reader *reader)
++static ULONG source_reader_release(struct source_reader *reader, LONG *scope_refcount, const char *scope)
+ {
+-    ULONG refcount = InterlockedDecrement(&reader->refcount);
++    ULONG refcount;
+     unsigned int i;
+ 
++    if (WINE_TRACE_ON(wmadiag)) InterlockedDecrement(scope_refcount);
++    refcount = InterlockedDecrement(&reader->refcount);
++
+     if (!refcount)
+     {
++        source_reader_trace_lifetime(reader, "destroy", scope);
+         if (reader->device_manager)
+             IUnknown_Release(reader->device_manager);
+         if (reader->async_callback)
+@@ -300,7 +331,6 @@ static ULONG source_reader_release(struct source_reader *reader)
+             IMFAttributes_Release(reader->attributes);
+         if (reader->queue)
+         {
+-            TRACE_(wmadiag)("event=source_reader_destroy source=%p queue=%#lx\n", reader->source, reader->queue);
+             MFUnlockWorkQueue(reader->queue);
+         }
+         IMFMediaSource_Release(reader->source);
+@@ -441,13 +471,13 @@ static ULONG WINAPI source_reader_source_events_callback_AddRef(IMFAsyncCallback *iface)
+ static ULONG WINAPI source_reader_source_events_callback_AddRef(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_source_callback_IMFAsyncCallback(iface);
+-    return source_reader_addref(reader);
++    return source_reader_addref(reader, &reader->source_events_refcount);
+ }
+ 
+ static ULONG WINAPI source_reader_source_events_callback_Release(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_source_callback_IMFAsyncCallback(iface);
+-    return source_reader_release(reader);
++    return source_reader_release(reader, &reader->source_events_refcount, "source_events");
+ }
+ 
+ static HRESULT WINAPI source_reader_callback_GetParameters(IMFAsyncCallback *iface,
+@@ -834,6 +864,7 @@ static HRESULT source_reader_end_of_presentation_handler(struct source_reader *reader)
+     LeaveCriticalSection(&reader->cs);
+ 
+     WakeAllConditionVariable(&reader->sample_event);
++    source_reader_trace_lifetime(reader, "end_of_presentation", "source_events");
+ 
+     return S_OK;
+ }
+@@ -918,13 +949,13 @@ static ULONG WINAPI source_reader_stream_events_callback_AddRef(IMFAsyncCallback *iface)
+ static ULONG WINAPI source_reader_stream_events_callback_AddRef(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_stream_callback_IMFAsyncCallback(iface);
+-    return source_reader_addref(reader);
++    return source_reader_addref(reader, &reader->stream_events_refcount);
+ }
+ 
+ static ULONG WINAPI source_reader_stream_events_callback_Release(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_stream_callback_IMFAsyncCallback(iface);
+-    return source_reader_release(reader);
++    return source_reader_release(reader, &reader->stream_events_refcount, "stream_events");
+ }
+ 
+ static void transform_entry_release_allocator(struct transform_entry *entry)
+@@ -1643,13 +1674,13 @@ static ULONG WINAPI source_reader_async_commands_callback_AddRef(IMFAsyncCallback *iface)
+ static ULONG WINAPI source_reader_async_commands_callback_AddRef(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_async_commands_callback_IMFAsyncCallback(iface);
+-    return source_reader_addref(reader);
++    return source_reader_addref(reader, &reader->async_commands_refcount);
+ }
+ 
+ static ULONG WINAPI source_reader_async_commands_callback_Release(IMFAsyncCallback *iface)
+ {
+     struct source_reader *reader = impl_from_async_commands_callback_IMFAsyncCallback(iface);
+-    return source_reader_release(reader);
++    return source_reader_release(reader, &reader->async_commands_refcount, "async_commands");
+ }
+ 
+ static struct stream_response * media_stream_detach_response(struct source_reader *reader, struct stream_response *response)
+@@ -2466,6 +2497,7 @@ static ULONG WINAPI src_reader_AddRef(IMFSourceReaderEx *iface)
+     ULONG refcount = InterlockedIncrement(&reader->public_refcount);
+ 
+     TRACE("%p, refcount %lu.\n", iface, refcount);
++    source_reader_trace_lifetime(reader, "addref", "public");
+ 
+     return refcount;
+ }
+@@ -2492,9 +2524,11 @@ static ULONG WINAPI src_reader_Release(IMFSourceReaderEx *iface)
+     ULONG refcount = InterlockedDecrement(&reader->public_refcount);
+ 
+     TRACE("%p, refcount %lu.\n", iface, refcount);
++    source_reader_trace_lifetime(reader, "release", "public");
+ 
+     if (!refcount)
+     {
++        source_reader_trace_lifetime(reader, "shutdown_begin", "public");
+         if (reader->flags & SOURCE_READER_SHUTDOWN_ON_RELEASE)
+             IMFMediaSource_Shutdown(reader->source);
+         else if (SUCCEEDED(IMFMediaSource_Stop(reader->source)))
+@@ -2509,7 +2543,8 @@ static ULONG WINAPI src_reader_Release(IMFSourceReaderEx *iface)
+             LeaveCriticalSection(&reader->cs);
+         }
+ 
+-        source_reader_release(reader);
++        source_reader_trace_lifetime(reader, "shutdown_complete", "public");
++        source_reader_release(reader, &reader->owner_refcount, "owner");
+     }
+ 
+     return refcount;
+@@ -3731,6 +3766,7 @@ static HRESULT create_source_reader_from_source(IMFMediaSource *source, IMFAttributes *attributes,
+     object->async_commands_callback.lpVtbl = &async_commands_callback_vtbl;
+     object->public_refcount = 1;
+     object->refcount = 1;
++    if (WINE_TRACE_ON(wmadiag)) object->owner_refcount = 1;
+     list_init(&object->responses);
+     if (shutdown_on_release)
+         object->flags |= SOURCE_READER_SHUTDOWN_ON_RELEASE;
+@@ -3834,6 +3870,7 @@ static HRESULT create_source_reader_from_source(IMFMediaSource *source, IMFAttributes *attributes,
+ 
+     TRACE_(wmadiag)("event=source_reader_queue source=%p policy=%s queue=%#lx streams=%lu\n",
+             object->source, windows_media_av ? "shared" : "serial", object->queue, object->stream_count);
++    source_reader_trace_lifetime(object, "create", "owner");
+ 
+     if (FAILED(hr = IMFMediaSource_BeginGetEvent(object->source, &object->source_events_callback,
+             (IUnknown *)object->source)))

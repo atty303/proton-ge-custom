@@ -56,6 +56,19 @@ Compare that candidate with a baseline record. A shorter candidate is decoded ag
 python3 wma-test-suite/compare_pcm.py REPORT.json CORPUS ARTIFACT.wma CANDIDATE.s16le
 ```
 
+For an end-to-end regression check, the suite can create an isolated temporary Proton prefix, run the
+Media Foundation candidate, and compare it in one command. The private fixture and FFmpeg report remain
+outside the repository. An exact PCM match exits with status 0; a truncated prefix or any other mismatch
+prints a structured comparison and exits with status 1.
+
+```text
+make -C wma-test-suite test-mf PROTON="$PWD/build/build-GE-Proton11-5-wma-diag/GE-Proton11-5-wma-diag/proton" BASELINE="$HOME/infinitas-asf-dump/ffmpeg-pcm-baseline.json" CORPUS="$HOME/infinitas-asf-dump" ARTIFACT=asf-wmav2-051f794cf1a241cd-40920.wma
+```
+
+The runner uses Proton's `runinprefix` verb so the standalone decoder does not pass through Steam game
+launch handling. Its prefix, cache, and candidate PCM are removed when the check finishes. Pass
+`STEAM_CLIENT_INSTALL=/path/to/Steam` if the default `$HOME/.local/share/Steam` is not correct.
+
 ## Passive ASF capture
 
 The experimental Proton build captures ASF input that `winedmo` already reads when

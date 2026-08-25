@@ -1,0 +1,179 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 12:00:00 +0900
+Subject: [PATCH] mfreadwrite: fully drain Source Reader transforms at EOS
+
+The synchronous Source Reader normally stops pulling transform output once it
+has queued a response for which the caller has not issued a request.  The same
+backpressure is currently applied after MFT_MESSAGE_COMMAND_DRAIN at EOS.
+
+This can lose most of a final transform output sample when its data is exposed
+over several ProcessOutput calls.  In particular, GE's FFmpeg WMA decoder may
+return a large decoded AVFrame through a sequence of fixed 8192-byte MFT output
+buffers marked MFT_OUTPUT_DATA_BUFFER_INCOMPLETE.  Source Reader pulls the first
+buffer, then queues EOS ahead of the rest.
+
+Source Reader also has two ways to reach EOS.  The MEEndOfStream event path
+drains the transform chain, while a synchronous MF_E_END_OF_STREAM return from
+IMFMediaStream::RequestSample queues EOS without draining it.
+
+Use one idempotent end-of-stream helper for both paths.  Carry the drain state
+through the transform chain and bypass normal consumer backpressure until every
+transform reports that it has no more output.  Keep the existing throttling
+unchanged during normal decoding.
+
+---
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -788,6 +788,32 @@
+     return hr == MF_E_END_OF_STREAM;
+ }
+ 
++static void source_reader_end_stream(struct source_reader *reader, struct media_stream *stream, const char *origin)
++{
++    struct list *ptr;
++    HRESULT hr;
++
++    if (stream->state == STREAM_STATE_EOS)
++        return;
++
++    stream->state = STREAM_STATE_EOS;
++    stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
++
++    TRACE_(wmadiag)("event=source_reader_stream_state action=eos origin=%s reader=%p source=%p stream=%u"
++            " requests=%u responses=%u\n", origin, reader, reader->source, stream->index,
++            stream->requests, stream->responses);
++
++    if ((ptr = list_head(&stream->transforms)))
++    {
++        struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
++        if (FAILED(hr = source_reader_drain_transform_samples(reader, stream, entry)))
++            WARN("Failed to drain pending samples, hr %#lx.\n", hr);
++    }
++
++    while (stream->requests)
++        source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
++}
++
+ static HRESULT source_reader_request_sample(struct source_reader *reader, struct media_stream *stream)
+ {
+     HRESULT hr = S_OK;
+@@ -798,10 +824,7 @@
+         {
+             if (source_reader_request_sample_eos(hr))
+             {
+-                stream->state = STREAM_STATE_EOS;
+-                stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
+-                while (stream->requests)
+-                    source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
++                source_reader_end_stream(reader, stream, "request");
+                 hr = S_OK;
+             }
+             else
+@@ -1210,7 +1233,7 @@
+ }
+ 
+ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry);
++        struct transform_entry *entry, BOOL draining);
+ static inline BOOL source_reader_is_nonfatal_transform_status(HRESULT hr)
+ {
+     return hr == MF_E_TRANSFORM_NEED_MORE_INPUT || hr == MF_E_END_OF_STREAM;
+@@ -1263,7 +1286,7 @@
+ }
+ 
+ static HRESULT source_reader_push_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry, IMFSample *sample)
++        struct transform_entry *entry, IMFSample *sample, BOOL draining)
+ {
+     LONG sequence = 0;
+     DWORD attempt = 0;
+@@ -1274,7 +1297,7 @@
+ 
+     do
+     {
+-        if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry))
++        if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry, draining))
+                 && !source_reader_is_nonfatal_transform_status(hr))
+         {
+             if (sequence)
+@@ -1289,7 +1312,7 @@
+             source_reader_trace_sample(reader, "transform_input", sequence, stream->index, entry->transform,
+                     attempt, hr, 0, 0, sample);
+         if (SUCCEEDED(hr))
+-            return source_reader_pull_transform_samples(reader, stream, entry);
++            return source_reader_pull_transform_samples(reader, stream, entry, draining);
+     }
+     while (hr == MF_E_NOTACCEPTING);
+ 
+@@ -1403,7 +1426,7 @@
+ }
+ 
+ static HRESULT source_reader_pull_transform_samples(struct source_reader *reader, struct media_stream *stream,
+-        struct transform_entry *entry)
++        struct transform_entry *entry, BOOL draining)
+ {
+     MFT_OUTPUT_STREAM_INFO stream_info = {0};
+     struct transform_entry *next = NULL;
+@@ -1457,7 +1480,7 @@
+             if (FAILED(hr))
+                 source_reader_queue_response(reader, stream, hr, MF_SOURCE_READERF_ERROR, 0, NULL);
+             else if (next)
+-                hr = source_reader_push_transform_samples(reader, stream, next, out_buffer.pSample);
++                hr = source_reader_push_transform_samples(reader, stream, next, out_buffer.pSample, draining);
+             else
+                 hr = source_reader_queue_sample(reader, stream, entry->pending_flags, out_buffer.pSample);
+ 
+@@ -1481,7 +1504,8 @@
+         if (out_buffer.pEvents)
+             IMFCollection_Release(out_buffer.pEvents);
+ 
+-        if (!reader->async_callback && stream->responses && !stream->requests
++        /* EOS is queued after draining, so do not leave transform output behind due to consumer backpressure. */
++        if (!draining && !reader->async_callback && stream->responses && !stream->requests
+                 && (!source_reader_stream_is_audio(stream) || !stream->unthrottled_audio_output))
+             break;
+     }
+@@ -1504,7 +1528,7 @@
+             " transform=%p status=%#lx\n", reader, reader->source, stream->index, entry->transform, hr);
+     if (FAILED(hr))
+         WARN("Failed to drain transform %p, hr %#lx\n", entry->transform, hr);
+-    if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry))
++    if (FAILED(hr = source_reader_pull_transform_samples(reader, stream, entry, TRUE))
+             && !source_reader_is_nonfatal_transform_status(hr))
+         WARN("Failed to pull pending samples, hr %#lx.\n", hr);
+ 
+@@ -1563,7 +1587,7 @@
+     entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+ 
+     /* It's assumed that decoder has 1 input and 1 output, both id's are 0. */
+-    if (SUCCEEDED(hr = source_reader_push_transform_samples(reader, stream, entry, sample))
++    if (SUCCEEDED(hr = source_reader_push_transform_samples(reader, stream, entry, sample, FALSE))
+             || source_reader_is_nonfatal_transform_status(hr))
+         hr = stream->requests ? source_reader_request_sample(reader, stream) : S_OK;
+     else
+@@ -1652,23 +1676,7 @@
+             switch (event_type)
+             {
+                 case MEEndOfStream:
+-                    stream->state = STREAM_STATE_EOS;
+-                    stream->flags &= ~(STREAM_FLAG_SAMPLE_REQUESTED | STREAM_FLAG_EOS_REPORTED);
+-
+-                    TRACE_(wmadiag)("event=source_reader_stream_state action=eos reader=%p source=%p stream=%u"
+-                            " requests=%u responses=%u\n", reader, reader->source, stream->index,
+-                            stream->requests, stream->responses);
+-
+-                    if ((ptr = list_head(&stream->transforms)))
+-                    {
+-                        struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+-                        if (FAILED(hr = source_reader_drain_transform_samples(reader, stream, entry)))
+-                            WARN("Failed to drain pending samples, hr %#lx.\n", hr);
+-                    }
+-
+-                    while (stream->requests)
+-                        source_reader_queue_response(reader, stream, S_OK, MF_SOURCE_READERF_ENDOFSTREAM, 0, NULL);
+-
++                    source_reader_end_stream(reader, stream, "event");
+                     break;
+                 case MEStreamSeeked:
+                     stream->state = STREAM_STATE_READY;

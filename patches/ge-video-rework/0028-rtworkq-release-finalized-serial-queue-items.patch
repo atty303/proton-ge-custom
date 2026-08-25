@@ -1,0 +1,155 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 16:20:00 +0900
+Subject: [PATCH] rtworkq: release finalized serial queue items
+
+The media rework routes each Source Reader's event callbacks through a
+private serial work queue.  serial_queue_submit() adds a reference while an
+item is on that queue's pending list, and pool_queue_submit() adds another
+reference to keep the item alive for its finalization callback.  The worker
+releases the dispatch reference when Invoke() returns.
+
+The serial finalizer removed the completed item from the pending list but
+released it only once.  One of the pending-list and finalizer references was
+therefore left behind for every regular serial callback.  The leaked async
+result retained the callback embedded in the Source Reader, which retained
+the Reader, which in turn kept its private queue handle locked.  Repeatedly
+creating Source Readers eventually exhausted the 124-entry private queue
+handle table even after all public Reader references had been released.
+
+Release both references after removing a regular item from the serial queue.
+This fixes the ownership imbalance at its source instead of raising the
+queue handle limit or forcibly tearing down an active queue.
+
+Store the published generation-bearing handle in queue->id as intended.  It
+is used by serial reply callbacks and makes the opt-in wmadiag finalization
+event correlate with queue_allocate, Source Reader lifetime, and queue_ref
+events.
+
+Add a regression test which runs two items through a serial queue and waits
+until their async results have no internal references.  Before this fix each
+result remains at refcount 2 and its final caller release returns 1.
+
+diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -464,6 +464,9 @@ static void CALLBACK serial_queue_finalization_callback(PTP_CALLBACK_INSTANCE instance, void *user_data)
+ {
+     struct work_item *item = (struct work_item *)user_data, *next_item;
+     struct queue *target_queue, *queue = item->queue;
++    DWORD queue_id = queue->id;
++    void *result = item->result;
++    ULONG refcount;
+     HRESULT hr;
+ 
+     EnterCriticalSection(&queue->cs);
+@@ -478,7 +481,11 @@ static void CALLBACK serial_queue_finalization_callback(PTP_CALLBACK_INSTANCE instance, void *user_data)
+ 
+     LeaveCriticalSection(&queue->cs);
+ 
++    /* Release both the pending-list reference and the reference held for this finalizer. */
+     IUnknown_Release(&item->IUnknown_iface);
++    refcount = IUnknown_Release(&item->IUnknown_iface);
++    TRACE_(wmadiag)("event=serial_queue_item action=finalize queue=%p handle=%#lx result=%p refcount=%lu\n",
++            queue, queue_id, result, refcount);
+ }
+ 
+ static HRESULT serial_queue_init(const struct queue_desc *desc, struct queue *queue)
+@@ -1038,6 +1044,7 @@ static HRESULT alloc_user_queue(const struct queue_desc *desc, DWORD *queue_id)
+     entry->generation = queue_generation;
+     idx = entry - user_queues + FIRST_USER_QUEUE_HANDLE;
+     *queue_id = (idx << 16) | entry->generation;
++    queue->id = *queue_id;
+     ++active_user_queue_count;
+     if (active_user_queue_count > high_water_user_queue_count)
+         high_water_user_queue_count = active_user_queue_count;
+diff --git a/dlls/rtworkq/tests/rtworkq.c b/dlls/rtworkq/tests/rtworkq.c
+--- a/dlls/rtworkq/tests/rtworkq.c
++++ b/dlls/rtworkq/tests/rtworkq.c
+@@ -173,6 +173,23 @@ static DWORD wait_async_callback_result(IRtwqAsyncCallback *iface, DWORD timeout, IRtwqAsyncResult **result)
+     return res;
+ }
+ 
++static LONG wait_async_result_refcount(IRtwqAsyncResult *result, DWORD timeout)
++{
++    DWORD start = GetTickCount();
++    LONG refcount;
++
++    do
++    {
++        IRtwqAsyncResult_AddRef(result);
++        refcount = IRtwqAsyncResult_Release(result);
++        if (refcount == 1)
++            break;
++        Sleep(1);
++    } while (GetTickCount() - start < timeout);
++
++    return refcount;
++}
++
+ static void test_platform_init(void)
+ {
+     APTTYPEQUALIFIER qualifier;
+@@ -669,6 +686,57 @@ static void test_queue_shutdown(void)
+     IRtwqAsyncCallback_Release(&test_callback2->IRtwqAsyncCallback_iface);
+ }
+ 
++static void test_serial_queue_item_lifetime(void)
++{
++    IRtwqAsyncResult *result, *result2, *callback_result;
++    struct test_callback *test_callback, *test_callback2;
++    DWORD res, queue;
++    LONG refcount;
++    HRESULT hr;
++
++    hr = RtwqStartup();
++    ok(hr == S_OK, "Failed to start up, hr %#lx.\n", hr);
++
++    test_callback = create_test_callback();
++    test_callback2 = create_test_callback();
++    hr = RtwqCreateAsyncResult(NULL, &test_callback->IRtwqAsyncCallback_iface, NULL, &result);
++    ok(hr == S_OK, "Failed to create result, hr %#lx.\n", hr);
++    hr = RtwqCreateAsyncResult(NULL, &test_callback2->IRtwqAsyncCallback_iface, NULL, &result2);
++    ok(hr == S_OK, "Failed to create result, hr %#lx.\n", hr);
++
++    hr = RtwqAllocateSerialWorkQueue(RTWQ_CALLBACK_QUEUE_MULTITHREADED, &queue);
++    ok(hr == S_OK, "Failed to allocate serial queue, hr %#lx.\n", hr);
++    hr = RtwqPutWorkItem(queue, 0, result);
++    ok(hr == S_OK, "Failed to queue first callback, hr %#lx.\n", hr);
++    hr = RtwqPutWorkItem(queue, 0, result2);
++    ok(hr == S_OK, "Failed to queue second callback, hr %#lx.\n", hr);
++
++    res = wait_async_callback_result(&test_callback->IRtwqAsyncCallback_iface, 1000, &callback_result);
++    ok(res == WAIT_OBJECT_0, "First callback did not finish, got %#lx.\n", res);
++
++    res = wait_async_callback_result(&test_callback2->IRtwqAsyncCallback_iface, 1000, &callback_result);
++    ok(res == WAIT_OBJECT_0, "Second callback did not finish, got %#lx.\n", res);
++
++    refcount = wait_async_result_refcount(result, 1000);
++    ok(refcount == 1, "First result still has internal references, refcount %ld.\n", refcount);
++    refcount = wait_async_result_refcount(result2, 1000);
++    ok(refcount == 1, "Second result still has internal references, refcount %ld.\n", refcount);
++
++    refcount = IRtwqAsyncResult_Release(result);
++    ok(!refcount, "Unexpected first result refcount %ld.\n", refcount);
++    refcount = IRtwqAsyncResult_Release(result2);
++    ok(!refcount, "Unexpected second result refcount %ld.\n", refcount);
++
++    hr = RtwqUnlockWorkQueue(queue);
++    ok(hr == S_OK, "Failed to unlock serial queue, hr %#lx.\n", hr);
++
++    hr = RtwqShutdown();
++    ok(hr == S_OK, "Failed to shut down, hr %#lx.\n", hr);
++
++    IRtwqAsyncCallback_Release(&test_callback->IRtwqAsyncCallback_iface);
++    IRtwqAsyncCallback_Release(&test_callback2->IRtwqAsyncCallback_iface);
++}
++
+ START_TEST(rtworkq)
+ {
+     test_platform_init();
+@@ -676,4 +744,5 @@ START_TEST(rtworkq)
+     test_work_queue();
+     test_scheduled_items();
+     test_queue_shutdown();
++    test_serial_queue_item_lifetime();
+ }

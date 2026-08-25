@@ -13,7 +13,7 @@ diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
 +WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
  
  #define FIRST_USER_QUEUE_HANDLE 5
- #define MAX_USER_QUEUE_HANDLES 2048
+ #define MAX_USER_QUEUE_HANDLES 124
 @@ -56,6 +57,10 @@
  static struct queue_handle *next_unused_user_queue = user_queues;
  static WORD queue_generation;

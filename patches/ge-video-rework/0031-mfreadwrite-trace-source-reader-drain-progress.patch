@@ -1,0 +1,106 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Wed, 26 Aug 2026 02:00:00 +0900
+Subject: [PATCH] mfreadwrite: trace Source Reader drain progress
+
+Add paired events around only the transform calls introduced or extended by
+the Source Reader EOS drain fix.  With Wine's microsecs channel, an unmatched
+begin event locates a blocked boundary and completed pairs show whether drain
+occupied the caller for long enough to explain an application hang.
+
+Use a separate mfdrain channel so this check does not require the much larger
+per-sample wmadiag trace.  The events contain only object identifiers,
+counters, and status codes and do not change decode flow.
+
+---
+diff --git a/dlls/mfreadwrite/reader.c b/dlls/mfreadwrite/reader.c
+--- a/dlls/mfreadwrite/reader.c
++++ b/dlls/mfreadwrite/reader.c
+@@ -40,6 +40,7 @@
+ #include "mf_private.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
++WINE_DECLARE_DEBUG_CHANNEL(mfdrain);
+ WINE_DECLARE_DEBUG_CHANNEL(wmadiag);
+ 
+ DEFINE_MEDIATYPE_GUID(MFVideoFormat_ABGR32, D3DFMT_A8B8G8R8);
+@@ -806,7 +807,14 @@
+     if ((ptr = list_head(&stream->transforms)))
+     {
+         struct transform_entry *entry = LIST_ENTRY(ptr, struct transform_entry, entry);
+-        if (FAILED(hr = source_reader_drain_transform_samples(reader, stream, entry)))
++        TRACE_(mfdrain)("event=source_reader_drain action=begin origin=%s reader=%p source=%p stream=%u"
++                " requests=%u responses=%u\n", origin, reader, reader->source, stream->index,
++                stream->requests, stream->responses);
++        hr = source_reader_drain_transform_samples(reader, stream, entry);
++        TRACE_(mfdrain)("event=source_reader_drain action=end origin=%s reader=%p source=%p stream=%u"
++                " requests=%u responses=%u status=%#lx\n", origin, reader, reader->source, stream->index,
++                stream->requests, stream->responses, hr);
++        if (FAILED(hr))
+             WARN("Failed to drain pending samples, hr %#lx.\n", hr);
+     }
+ 
+@@ -1432,6 +1440,7 @@
+     struct transform_entry *next = NULL;
+     struct list *ptr;
+     DWORD status;
++    DWORD drain_attempt = 0;
+     HRESULT hr;
+ 
+     if ((ptr = list_next(&stream->transforms, &entry->entry)))
+@@ -1447,6 +1456,11 @@
+         return hr;
+     stream_info.cbSize = max(stream_info.cbSize, entry->min_buffer_size);
+ 
++    if (draining)
++        TRACE_(mfdrain)("event=source_reader_transform action=drain_pull_begin reader=%p source=%p stream=%u"
++                " transform=%p requests=%u responses=%u\n", reader, reader->source, stream->index,
++                entry->transform, stream->requests, stream->responses);
++
+     while (SUCCEEDED(hr))
+     {
+         MFT_OUTPUT_DATA_BUFFER out_buffer = {0};
+@@ -1456,7 +1470,18 @@
+                 && FAILED(hr = source_reader_allocate_stream_sample(reader, entry, &stream_info, &out_buffer.pSample)))
+             break;
+ 
++        if (draining)
++            TRACE_(mfdrain)("event=source_reader_transform action=drain_output_begin reader=%p source=%p"
++                    " stream=%u transform=%p attempt=%lu requests=%u responses=%u\n", reader, reader->source,
++                    stream->index, entry->transform, ++drain_attempt, stream->requests, stream->responses);
++
+         hr = IMFTransform_ProcessOutput(entry->transform, 0, 1, &out_buffer, &status);
++
++        if (draining)
++            TRACE_(mfdrain)("event=source_reader_transform action=drain_output_end reader=%p source=%p"
++                    " stream=%u transform=%p attempt=%lu status=%#lx output_status=%#lx sample=%p"
++                    " requests=%u responses=%u\n", reader, reader->source, stream->index, entry->transform,
++                    drain_attempt, hr, out_buffer.dwStatus, out_buffer.pSample, stream->requests, stream->responses);
+         if (WINE_TRACE_ON(wmadiag) && source_reader_stream_is_audio(stream))
+         {
+             LONG sequence = InterlockedIncrement(&reader->diagnostic_output_sequence);
+@@ -1510,6 +1535,11 @@
+             break;
+     }
+ 
++    if (draining)
++        TRACE_(mfdrain)("event=source_reader_transform action=drain_pull_end reader=%p source=%p stream=%u"
++                " transform=%p attempts=%lu requests=%u responses=%u status=%#lx\n", reader, reader->source,
++                stream->index, entry->transform, drain_attempt, stream->requests, stream->responses, hr);
++
+     return hr;
+ }
+ 
+@@ -1523,7 +1553,13 @@
+     if ((ptr = list_next(&stream->transforms, &entry->entry)))
+         next = LIST_ENTRY(ptr, struct transform_entry, entry);
+ 
++    TRACE_(mfdrain)("event=source_reader_transform action=drain_message_begin reader=%p source=%p stream=%u"
++            " transform=%p requests=%u responses=%u\n", reader, reader->source, stream->index,
++            entry->transform, stream->requests, stream->responses);
+     hr = IMFTransform_ProcessMessage(entry->transform, MFT_MESSAGE_COMMAND_DRAIN, 0);
++    TRACE_(mfdrain)("event=source_reader_transform action=drain_message_end reader=%p source=%p stream=%u"
++            " transform=%p requests=%u responses=%u status=%#lx\n", reader, reader->source, stream->index,
++            entry->transform, stream->requests, stream->responses, hr);
+     TRACE_(wmadiag)("event=source_reader_transform action=drain reader=%p source=%p stream=%u"
+             " transform=%p status=%#lx\n", reader, reader->source, stream->index, entry->transform, hr);
+     if (FAILED(hr))

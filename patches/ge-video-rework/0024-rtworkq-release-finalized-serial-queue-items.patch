@@ -1,0 +1,37 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 16:20:00 +0900
+Subject: [PATCH] rtworkq: release finalized serial queue items
+
+serial_queue_submit() adds a reference while an item is on the serial queue's
+pending list, and pool_queue_submit() adds another reference to keep the item
+alive for its finalization callback. The worker releases the dispatch reference
+when Invoke() returns.
+
+The serial finalizer removes the completed item from the pending list but only
+releases one reference. Release both the pending-list and finalizer references
+after removing the item. Otherwise the leaked async result retains its callback
+and can keep a Source Reader and its private queue handle alive indefinitely.
+
+Also store the published generation-bearing user queue handle in queue->id, so
+serial reply callbacks report the correct queue ID.
+
+diff --git a/dlls/rtworkq/queue.c b/dlls/rtworkq/queue.c
+--- a/dlls/rtworkq/queue.c
++++ b/dlls/rtworkq/queue.c
+@@ -461,6 +461,8 @@ static void CALLBACK serial_queue_finalization_callback(PTP_CALLBACK_INSTANCE instance, void *user_data)
+ 
+     LeaveCriticalSection(&queue->cs);
+ 
++    /* Release both the pending-list reference and the reference held for this finalizer. */
++    IUnknown_Release(&item->IUnknown_iface);
+     IUnknown_Release(&item->IUnknown_iface);
+ }
+ 
+@@ -1008,6 +1010,7 @@ static HRESULT alloc_user_queue(const struct queue_desc *desc, DWORD *queue_id)
+     entry->generation = queue_generation;
+     idx = entry - user_queues + FIRST_USER_QUEUE_HANDLE;
+     *queue_id = (idx << 16) | entry->generation;
++    queue->id = *queue_id;
+ 
+     LeaveCriticalSection(&queues_section);
+ 

@@ -705,6 +705,28 @@ endif
 	touch $@
 
 ##
+## PipeASIO
+##
+
+ifneq ($(findstring x86_64,$(unix_ARCHS)),)
+PIPEASIO_DEPENDS = wine
+PIPEASIO_CMAKE_ARGS = \
+	-DBUILD_SETTINGS_PANEL=OFF \
+	-DBUILD_TESTS=OFF \
+	-DCMAKE_BUILD_TYPE=Release \
+	-DWINEBUILD=$(WINE_x86_64_DST)/bin/winebuild \
+	-DWINEGCC=$(WINE_x86_64_DST)/bin/winegcc
+
+$(eval $(call rules-source,pipeasio,$(SRCDIR)/pipeasio))
+$(eval $(call rules-cmake,pipeasio,x86_64,unix))
+
+$(OBJ)/.pipeasio-x86_64-post-build:
+	mkdir -p $(DST_DIR)/bin
+	cp -a $(PIPEASIO_x86_64_DST)/bin/pipeasio-register $(DST_DIR)/bin/
+	touch $@
+endif
+
+##
 ## vrclient
 ##
 
@@ -1582,6 +1604,9 @@ endif
 ##
 
 default_pfx: wine lsteamclient steamexe vrclient dxvk d7vk dxvk-nvapi vkd3d-proton
+ifneq ($(findstring x86_64,$(unix_ARCHS)),)
+default_pfx: pipeasio
+endif
 	find $(DST_LIBDIR)/wine -type f -execdir chmod a-w '{}' '+'
 	rm -rf $(abspath $(DIST_PREFIX))
 	rm -rf $(abspath $(DIST_PREFIX_ARM64))
@@ -1742,6 +1767,7 @@ deploy: all
 
 .PHONY: redist
 redist: all
+	rm -rf $(REDIST_DIR) $(BUILD_NAME)
 	mkdir -p $(REDIST_DIR)
 	rsync --delete -arx $(DST_BASE)/ $(REDIST_DIR)
 	mv $(REDIST_DIR) $(BUILD_NAME)

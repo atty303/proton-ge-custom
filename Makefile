@@ -52,11 +52,6 @@ else
 protonsdk_version := $(shell grep '^STEAMRT_IMAGE ' Makefile.in|xargs echo|cut -d: -f2)
 endif
 
-enable_ccache := 1
-ifneq ($(enable_ccache),0)
-    CONFIGURE_CMD += --enable-ccache
-endif
-
 TOPLEVELGOALS := all any clean configure deploy downloads help install module proton protonsdk redist
 CONTAINERGOALS := $(filter-out $(TOPLEVELGOALS),$(MAKECMDGOALS))
 CONTAINERGOALS := $(filter-out $(BUILD_ROOT)/%,$(CONTAINERGOALS))
@@ -70,7 +65,7 @@ help:
 	@echo "\"Quick start\" Makefile targets:"
 	@echo "  install - Install Proton into current user's Steam installation"
 	@echo "  redist - Build a package suitable for manual installation or distribution"
-	@echo "           to other users in $(BUILD_ROOT)/ named after the nearest git tag"
+	@echo "           at $(BUILD_DIR)/$(_build_name).tar.gz"
 	@echo "  deploy - Build Steam deployment files into a directory in $(BUILD_ROOT)/ named"
 	@echo "           after the nearest git tag"
 	@echo "  clean - Delete the Proton build directory"
@@ -82,7 +77,6 @@ help:
 	@echo "               remember to always set it!"
 	@echo "               Current build name: $(_build_name)"
 	@echo "  unstripped - Set to non-empty to avoid stripping installed library files."
-	@echo "  enable_ccache - Enabled by default, set to 0 prior to configuring to disable ccache."
 	@echo "  protonsdk_version - Version of the proton sdk image to use for building,"
 	@echo "                      use protonsdk_version=local to build it locally."
 	@echo ""
@@ -100,8 +94,8 @@ help:
 	@echo "  make install - Build Proton and install into this user's Steam installation,"
 	@echo "      with the current Proton branch name as the tool's name."
 	@echo ""
-	@echo "  make redist - Build a Proton redistribution package in a tagged directory"
-	@echo "      in $(BUILD_ROOT)/."
+	@echo "  make redist - Build a Proton redistribution package at"
+	@echo "      $(BUILD_DIR)/$(_build_name).tar.gz."
 	@echo ""
 	@echo "  make build_name=mytest install - Build Proton with the tool name \"mytest\" and"
 	@echo "      install into this user's Steam installation."
@@ -133,12 +127,9 @@ install: configure
 	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C $(BUILD_DIR)/ $(UNSTRIPPED) install
 	echo "Proton installed to your local Steam installation"
 
-redist: | $(BUILD_ROOT)/$(DEPLOY_DIR)
 redist: configure
-	rm -rf $(BUILD_ROOT)/$(DEPLOY_DIR)/* && \
-	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C $(BUILD_DIR)/ $(UNSTRIPPED) redist && \
-	cp -Rf $(BUILD_DIR)/redist/* $(BUILD_ROOT)/$(DEPLOY_DIR) && \
-	echo "Proton build available at $(BUILD_ROOT)/$(DEPLOY_DIR)"
+	$(MAKE) $(MFLAGS) $(MAKEOVERRIDES) -C $(BUILD_DIR)/ $(UNSTRIPPED) redist
+	echo "Proton build available at $(BUILD_DIR)/$(_build_name).tar.gz"
 
 deploy: | $(BUILD_ROOT)/$(DEPLOY_DIR)-deploy
 deploy: configure

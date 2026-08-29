@@ -136,9 +136,13 @@ def make_default_pfx(default_pfx_dir, dist_dir, arm64):
 
 
     bin_dir = os.path.join(dist_dir, 'bin-arm64' if arm64 else 'bin')
-    subprocess.run(runtime_args + ["/bin/bash", "-c",
-        os.path.join(bin_dir, 'wine') + " wineboot && " +
-        os.path.join(bin_dir, 'wineserver') + " -w"],
+    wine_commands = [os.path.join(bin_dir, 'wine') + " wineboot"]
+    pipeasio_dll = os.path.join(dist_dir, 'lib/wine/x86_64-windows/pipeasio64.dll')
+    if not arm64 and os.path.exists(pipeasio_dll):
+        wine_commands.append(os.path.join(bin_dir, 'wine') + " regsvr32 /s pipeasio64.dll")
+    wine_commands.append(os.path.join(bin_dir, 'wineserver') + " -w")
+
+    subprocess.run(runtime_args + ["/bin/bash", "-c", " && ".join(wine_commands)],
 
         env=local_env, check=True)
     setup_dll_symlinks(default_pfx_dir, dist_dir, arm64)

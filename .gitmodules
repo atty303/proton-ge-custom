@@ -133,3 +133,6 @@
 [submodule "pipewire"]
 	path = pipewire
 	url = https://gitlab.freedesktop.org/pipewire/pipewire.git
+[submodule "pipeasio"]
+	path = pipeasio
+	url = https://github.com/M0n7y5/pipeasio.git

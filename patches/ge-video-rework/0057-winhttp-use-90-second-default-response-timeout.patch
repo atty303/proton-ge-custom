@@ -1,0 +1,22 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 02:55:59 +0900
+Subject: [PATCH] winhttp: use 90 second response timeout default
+
+WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT defaults to 90 seconds on Windows.
+Wine currently substitutes 21 seconds when the option was not explicitly set,
+which can time out a slow response before applications expect it to.
+
+Use the documented default without changing explicitly configured timeouts.
+
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -43,7 +43,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
+ 
+ #define DEFAULT_KEEP_ALIVE_TIMEOUT 30000
+ 
+-#define ACTUAL_DEFAULT_RECEIVE_RESPONSE_TIMEOUT 21000
++#define ACTUAL_DEFAULT_RECEIVE_RESPONSE_TIMEOUT 90000
+ 
+ static int request_receive_response_timeout( struct request *req )
+ {

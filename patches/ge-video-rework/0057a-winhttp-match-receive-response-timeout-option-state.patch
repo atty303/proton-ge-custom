@@ -1,0 +1,399 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 00:00:00 +0900
+Subject: [PATCH 1/2] winhttp: Match receive response timeout option state
+
+Windows 11 build 26200 reports a 30 second receive timeout and a 90 second
+receive-response timeout by default, but distinguishes that default response
+value from one explicitly configured by the application.
+
+Track the explicit state separately, clamp an explicit response timeout to the
+current receive timeout, and preserve the timeout snapshot when a request is
+created.  Keep INFINITE as a distinct DWORD value instead of relying on signed
+comparisons.
+
+Add session and request tests for the observed setter matrix and request
+inheritance.
+
+diff --git a/dlls/winhttp/session.c b/dlls/winhttp/session.c
+index 22f209fffca355f2fbbfe67b979523faf924bd97..c5eeca69712698f4290c35dad8122ecfb871ba3b 100644
+--- a/dlls/winhttp/session.c
++++ b/dlls/winhttp/session.c
+@@ -42,7 +42,34 @@ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
+ #define DEFAULT_CONNECT_TIMEOUT             20000
+ #define DEFAULT_SEND_TIMEOUT                30000
+ #define DEFAULT_RECEIVE_TIMEOUT             30000
+-#define DEFAULT_RECEIVE_RESPONSE_TIMEOUT    ~0u
++#define DEFAULT_RECEIVE_RESPONSE_TIMEOUT    90000
++
++static DWORD max_timeout( DWORD timeout, DWORD minimum )
++{
++    if (timeout == INFINITE || minimum == INFINITE) return INFINITE;
++    return max( timeout, minimum );
++}
++
++static DWORD get_receive_response_timeout( DWORD receive_timeout, DWORD response_timeout,
++                                           BOOL response_timeout_set )
++{
++    if (response_timeout_set) return response_timeout;
++    return max_timeout( DEFAULT_RECEIVE_RESPONSE_TIMEOUT, receive_timeout );
++}
++
++static void set_receive_timeout( DWORD *receive_timeout, DWORD *response_timeout,
++                                 BOOL response_timeout_set, DWORD timeout )
++{
++    *receive_timeout = timeout;
++    if (response_timeout_set) *response_timeout = max_timeout( *response_timeout, timeout );
++}
++
++static void set_receive_response_timeout( DWORD receive_timeout, DWORD *response_timeout,
++                                          BOOL *response_timeout_set, DWORD timeout )
++{
++    *response_timeout = max_timeout( timeout, receive_timeout );
++    *response_timeout_set = TRUE;
++}
+ 
+ void send_callback( struct object_header *hdr, DWORD status, void *info, DWORD buflen )
+ {
+@@ -140,7 +167,8 @@ static BOOL session_query_option( struct object_header *hdr, DWORD option, void
+     case WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT:
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        *(DWORD *)buffer = session->receive_response_timeout;
++        *(DWORD *)buffer = get_receive_response_timeout( session->receive_timeout,
++                session->receive_response_timeout, session->receive_response_timeout_set );
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
+@@ -223,11 +251,13 @@ static BOOL session_set_option( struct object_header *hdr, DWORD option, void *b
+         return TRUE;
+ 
+     case WINHTTP_OPTION_RECEIVE_TIMEOUT:
+-        session->receive_timeout = *(DWORD *)buffer;
++        set_receive_timeout( &session->receive_timeout, &session->receive_response_timeout,
++                session->receive_response_timeout_set, *(DWORD *)buffer );
+         return TRUE;
+ 
+     case WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT:
+-        session->receive_response_timeout = *(DWORD *)buffer;
++        set_receive_response_timeout( session->receive_timeout, &session->receive_response_timeout,
++                &session->receive_response_timeout_set, *(DWORD *)buffer );
+         return TRUE;
+ 
+     case WINHTTP_OPTION_CONFIGURE_PASSPORT_AUTH:
+@@ -418,7 +448,9 @@ static BOOL connect_query_option( struct object_header *hdr, DWORD option, void
+     case WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT:
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        *(DWORD *)buffer = connect->session->receive_response_timeout;
++        *(DWORD *)buffer = get_receive_response_timeout( connect->session->receive_timeout,
++                connect->session->receive_response_timeout,
++                connect->session->receive_response_timeout_set );
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
+@@ -914,7 +946,8 @@ static BOOL request_query_option( struct object_header *hdr, DWORD option, void
+     case WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT:
+         if (!validate_buffer( buffer, buflen, sizeof(DWORD) )) return FALSE;
+ 
+-        *(DWORD *)buffer = request->receive_response_timeout;
++        *(DWORD *)buffer = get_receive_response_timeout( request->receive_timeout,
++                request->receive_response_timeout, request->receive_response_timeout_set );
+         *buflen = sizeof(DWORD);
+         return TRUE;
+ 
+@@ -1084,11 +1117,13 @@ static BOOL request_set_option( struct object_header *hdr, DWORD option, void *b
+         return TRUE;
+ 
+     case WINHTTP_OPTION_RECEIVE_TIMEOUT:
+-        request->receive_timeout = *(DWORD *)buffer;
++        set_receive_timeout( &request->receive_timeout, &request->receive_response_timeout,
++                request->receive_response_timeout_set, *(DWORD *)buffer );
+         return TRUE;
+ 
+     case WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT:
+-        request->receive_response_timeout = *(DWORD *)buffer;
++        set_receive_response_timeout( request->receive_timeout, &request->receive_response_timeout,
++                &request->receive_response_timeout_set, *(DWORD *)buffer );
+         return TRUE;
+ 
+     case WINHTTP_OPTION_USERNAME:
+@@ -1333,6 +1368,7 @@ HINTERNET WINAPI WinHttpOpenRequest( HINTERNET hconnect, const WCHAR *verb, cons
+     request->send_timeout = connect->session->send_timeout;
+     request->receive_timeout = connect->session->receive_timeout;
+     request->receive_response_timeout = connect->session->receive_response_timeout;
++    request->receive_response_timeout_set = connect->session->receive_response_timeout_set;
+     request->max_redirects = 10;
+     request->websocket_receive_buffer_size = connect->session->websocket_receive_buffer_size;
+     request->websocket_send_buffer_size = connect->session->websocket_send_buffer_size;
+@@ -2549,7 +2585,8 @@ BOOL WINAPI WinHttpSetTimeouts( HINTERNET handle, int resolve, int connect, int
+         request->send_timeout = send;
+ 
+         if (receive < 0) receive = 0;
+-        request->receive_timeout = receive;
++        set_receive_timeout( &request->receive_timeout, &request->receive_response_timeout,
++                request->receive_response_timeout_set, receive );
+ 
+         if (request->netconn)
+         {
+@@ -2570,7 +2607,8 @@ BOOL WINAPI WinHttpSetTimeouts( HINTERNET handle, int resolve, int connect, int
+         session->send_timeout = send;
+ 
+         if (receive < 0) receive = 0;
+-        session->receive_timeout = receive;
++        set_receive_timeout( &session->receive_timeout, &session->receive_response_timeout,
++                session->receive_response_timeout_set, receive );
+         break;
+     }
+     default:
+diff --git a/dlls/winhttp/tests/winhttp.c b/dlls/winhttp/tests/winhttp.c
+index 8c28d89554c1be7f2fb195fc5f2150de5463889c..f0d928c9d6fd92d480395b6b081bbf2b7985a2e7 100644
+--- a/dlls/winhttp/tests/winhttp.c
++++ b/dlls/winhttp/tests/winhttp.c
+@@ -2121,7 +2121,7 @@ static void test_timeouts(void)
+     size  = sizeof(value);
+     ret = WinHttpQueryOption(req, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &value, &size);
+     ok(ret, "%lu\n", GetLastError());
+-    ok(value == ~0u, "got %lu\n", value);
++    ok(value == 0xbeefdead, "got %lu\n", value);
+ 
+     SetLastError(0xdeadbeef);
+     value = 30000;
+@@ -2133,14 +2133,14 @@ static void test_timeouts(void)
+     size  = sizeof(value);
+     ret = WinHttpQueryOption(req, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &value, &size);
+     ok(ret, "%lu\n", GetLastError());
+-    todo_wine ok(value == 0xbeefdead, "got %lu\n", value);
++    ok(value == 0xbeefdead, "got %lu\n", value);
+ 
+     SetLastError(0xdeadbeef);
+     value = 0xdeadbeef;
+     size  = sizeof(value);
+     ret = WinHttpQueryOption(con, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &value, &size);
+     ok(ret, "%lu\n", GetLastError());
+-    ok(value == ~0u, "got %lu\n", value);
++    ok(value == 90000 || broken(value == ~0u), "got %lu\n", value);
+ 
+     SetLastError(0xdeadbeef);
+     value = 30000;
+@@ -2153,7 +2153,7 @@ static void test_timeouts(void)
+     size  = sizeof(value);
+     ret = WinHttpQueryOption(ses, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &value, &size);
+     ok(ret, "%lu\n", GetLastError());
+-    ok(value == ~0u, "got %lu\n", value);
++    ok(value == 90000 || broken(value == ~0u), "got %lu\n", value);
+ 
+     SetLastError(0xdeadbeef);
+     value = 48878;
+@@ -2165,7 +2165,7 @@ static void test_timeouts(void)
+     size  = sizeof(value);
+     ret = WinHttpQueryOption(ses, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, &value, &size);
+     ok(ret, "%lu\n", GetLastError());
+-    todo_wine ok(value == 48879, "got %lu\n", value);
++    ok(value == 48879, "got %lu\n", value);
+ 
+     SetLastError(0xdeadbeef);
+     value = 48880;
+@@ -2184,6 +2184,165 @@ static void test_timeouts(void)
+     WinHttpCloseHandle(ses);
+ }
+ 
++static DWORD query_timeout_option(HINTERNET handle, DWORD option)
++{
++    DWORD value = 0xdeadbeef, size = sizeof(value);
++    BOOL ret;
++
++    ret = WinHttpQueryOption(handle, option, &value, &size);
++    ok(ret, "WinHttpQueryOption(%lu) failed: %lu\n", option, GetLastError());
++    ok(size == sizeof(value), "unexpected size %lu\n", size);
++    return value;
++}
++
++static void set_timeout_option(HINTERNET handle, DWORD option, DWORD value)
++{
++    BOOL ret = WinHttpSetOption(handle, option, &value, sizeof(value));
++    ok(ret, "WinHttpSetOption(%lu, %lu) failed: %lu\n", option, value, GetLastError());
++}
++
++static void test_receive_response_timeout_options(void)
++{
++    static const struct
++    {
++        BOOL set_receive;
++        DWORD receive;
++        BOOL set_response;
++        DWORD response;
++        BOOL response_first;
++        DWORD expected_receive;
++        DWORD expected_response;
++    }
++    tests[] =
++    {
++        {FALSE, 0,      FALSE, 0,        FALSE, 30000,    90000},
++        {FALSE, 0,      TRUE,  0,        FALSE, 30000,    30000},
++        {FALSE, 0,      TRUE,  1000,     FALSE, 30000,    30000},
++        {TRUE,  2000,   FALSE, 0,        FALSE, 2000,     90000},
++        {TRUE,  2000,   TRUE,  3000,     FALSE, 2000,     3000},
++        {TRUE,  4000,   TRUE,  3000,     FALSE, 4000,     4000},
++        {TRUE,  4000,   TRUE,  3000,     TRUE,  4000,     4000},
++        {TRUE,  120000, FALSE, 0,        FALSE, 120000,   120000},
++        {TRUE,  0,      FALSE, 0,        FALSE, 0,        90000},
++        {TRUE,  INFINITE, FALSE, 0,      FALSE, INFINITE, INFINITE},
++        {FALSE, 0,      TRUE,  INFINITE, FALSE, 30000,    INFINITE},
++    };
++    unsigned int handle_type, i;
++
++    for (handle_type = 0; handle_type < 2; ++handle_type)
++    {
++        for (i = 0; i < ARRAY_SIZE(tests); ++i)
++        {
++            HINTERNET session, connect = NULL, request = NULL, target;
++
++            winetest_push_context("handle %s, test %u", handle_type ? "request" : "session", i);
++            session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++            ok(!!session, "WinHttpOpen failed: %lu\n", GetLastError());
++            if (handle_type)
++            {
++                connect = WinHttpConnect(session, L"localhost", 80, 0);
++                ok(!!connect, "WinHttpConnect failed: %lu\n", GetLastError());
++                request = WinHttpOpenRequest(connect, NULL, NULL, NULL, NULL, NULL, 0);
++                ok(!!request, "WinHttpOpenRequest failed: %lu\n", GetLastError());
++                target = request;
++            }
++            else target = session;
++
++            if (tests[i].response_first && tests[i].set_response)
++                set_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, tests[i].response);
++            if (tests[i].set_receive)
++                set_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT, tests[i].receive);
++            if (!tests[i].response_first && tests[i].set_response)
++                set_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, tests[i].response);
++
++            ok(query_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT) == tests[i].expected_receive,
++                    "unexpected receive timeout\n");
++            ok(query_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == tests[i].expected_response,
++                    "unexpected receive response timeout\n");
++
++            if (request) WinHttpCloseHandle(request);
++            if (connect) WinHttpCloseHandle(connect);
++            WinHttpCloseHandle(session);
++            winetest_pop_context();
++        }
++    }
++}
++
++static void test_receive_response_timeout_retention(void)
++{
++    unsigned int handle_type;
++
++    for (handle_type = 0; handle_type < 2; ++handle_type)
++    {
++        HINTERNET session, connect = NULL, request = NULL, target;
++
++        winetest_push_context("handle %s", handle_type ? "request" : "session");
++        session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++        ok(!!session, "WinHttpOpen failed: %lu\n", GetLastError());
++        if (handle_type)
++        {
++            connect = WinHttpConnect(session, L"localhost", 80, 0);
++            ok(!!connect, "WinHttpConnect failed: %lu\n", GetLastError());
++            request = WinHttpOpenRequest(connect, NULL, NULL, NULL, NULL, NULL, 0);
++            ok(!!request, "WinHttpOpenRequest failed: %lu\n", GetLastError());
++            target = request;
++        }
++        else target = session;
++
++        set_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT, 2000);
++        set_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, 3000);
++        set_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT, 4000);
++        ok(query_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == 4000,
++                "unexpected raised response timeout\n");
++        set_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT, 1000);
++        ok(query_timeout_option(target, WINHTTP_OPTION_RECEIVE_TIMEOUT) == 1000,
++                "unexpected lowered receive timeout\n");
++        ok(query_timeout_option(target, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == 4000,
++                "response timeout was lowered\n");
++
++        if (request) WinHttpCloseHandle(request);
++        if (connect) WinHttpCloseHandle(connect);
++        WinHttpCloseHandle(session);
++        winetest_pop_context();
++    }
++}
++
++static void test_receive_response_timeout_inheritance(void)
++{
++    HINTERNET session, connect, request1, request2;
++
++    session = WinHttpOpen(L"winetest", 0, NULL, NULL, 0);
++    ok(!!session, "WinHttpOpen failed: %lu\n", GetLastError());
++    set_timeout_option(session, WINHTTP_OPTION_RECEIVE_TIMEOUT, 2000);
++    set_timeout_option(session, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, 3000);
++    connect = WinHttpConnect(session, L"localhost", 80, 0);
++    ok(!!connect, "WinHttpConnect failed: %lu\n", GetLastError());
++    request1 = WinHttpOpenRequest(connect, NULL, NULL, NULL, NULL, NULL, 0);
++    ok(!!request1, "WinHttpOpenRequest failed: %lu\n", GetLastError());
++
++    set_timeout_option(session, WINHTTP_OPTION_RECEIVE_TIMEOUT, 4000);
++    request2 = WinHttpOpenRequest(connect, NULL, NULL, NULL, NULL, NULL, 0);
++    ok(!!request2, "WinHttpOpenRequest failed: %lu\n", GetLastError());
++
++    ok(query_timeout_option(session, WINHTTP_OPTION_RECEIVE_TIMEOUT) == 4000,
++            "unexpected session receive timeout\n");
++    ok(query_timeout_option(session, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == 4000,
++            "unexpected session response timeout\n");
++    ok(query_timeout_option(request1, WINHTTP_OPTION_RECEIVE_TIMEOUT) == 2000,
++            "unexpected existing request receive timeout\n");
++    ok(query_timeout_option(request1, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == 3000,
++            "unexpected existing request response timeout\n");
++    ok(query_timeout_option(request2, WINHTTP_OPTION_RECEIVE_TIMEOUT) == 4000,
++            "unexpected new request receive timeout\n");
++    ok(query_timeout_option(request2, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT) == 4000,
++            "unexpected new request response timeout\n");
++
++    WinHttpCloseHandle(request2);
++    WinHttpCloseHandle(request1);
++    WinHttpCloseHandle(connect);
++    WinHttpCloseHandle(session);
++}
++
+ static void test_resolve_timeout(void)
+ {
+     HINTERNET ses, con, req;
+@@ -6376,6 +6535,9 @@ START_TEST (winhttp)
+     test_set_default_proxy_config();
+     test_empty_headers_param();
+     test_timeouts();
++    test_receive_response_timeout_options();
++    test_receive_response_timeout_retention();
++    test_receive_response_timeout_inheritance();
+     test_resolve_timeout();
+     test_credentials();
+     test_IWinHttpRequest_Invoke();
+diff --git a/dlls/winhttp/winhttp_private.h b/dlls/winhttp/winhttp_private.h
+index 9ffc321a6278a2e107265f710bf41f1a712c1d39..4ecb33079e17fc286a2d7bedfe30579d914d9ec0 100644
+--- a/dlls/winhttp/winhttp_private.h
++++ b/dlls/winhttp/winhttp_private.h
+@@ -75,8 +75,9 @@ struct session
+     int resolve_timeout;
+     int connect_timeout;
+     int send_timeout;
+-    int receive_timeout;
+-    int receive_response_timeout;
++    DWORD receive_timeout;
++    DWORD receive_response_timeout;
++    BOOL receive_response_timeout_set;
+     WCHAR *proxy_server;
+     WCHAR *proxy_bypass;
+     WCHAR *proxy_username;
+@@ -209,8 +210,9 @@ struct request
+     int resolve_timeout;
+     int connect_timeout;
+     int send_timeout;
+-    int receive_timeout;
+-    int receive_response_timeout;
++    DWORD receive_timeout;
++    DWORD receive_response_timeout;
++    BOOL receive_response_timeout_set;
+     DWORD max_redirects;
+     DWORD redirect_count; /* total number of redirects during this request */
+     WCHAR *status_text;

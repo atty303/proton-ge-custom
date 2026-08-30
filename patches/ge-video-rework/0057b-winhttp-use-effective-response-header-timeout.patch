@@ -1,0 +1,272 @@
+From: atty303 <atty303@users.noreply.github.com>
+Date: Sun, 30 Aug 2026 00:00:01 +0900
+Subject: [PATCH 2/2] winhttp: Use the effective response header timeout
+
+The receive-response option is not an absolute deadline for receiving all
+response headers.  Windows applies it to individual header reads when the
+application explicitly sets the option.  With the default, Windows reports 90
+seconds through the option query but uses the ordinary receive timeout while
+waiting for response headers.
+
+Replace Wine's undocumented 21 second fallback with a selector that preserves
+that distinction.  Apply it to normal responses and proxy CONNECT replies,
+then restore the ordinary receive timeout after the headers as before.
+
+Add loopback tests for the implicit timeout, explicit short and long timeouts,
+and a response whose partial headers continue beyond one timeout interval.
+
+diff --git a/dlls/winhttp/request.c b/dlls/winhttp/request.c
+index 731e1b2aab2a133e39f9fd1ef2f59c1a3d77855b..c5f28fef1c70a55f2937b6952bfb4fa2dcf28a71 100644
+--- a/dlls/winhttp/request.c
++++ b/dlls/winhttp/request.c
+@@ -43,12 +43,10 @@ WINE_DEFAULT_DEBUG_CHANNEL(winhttp);
+ 
+ #define DEFAULT_KEEP_ALIVE_TIMEOUT 30000
+ 
+-#define ACTUAL_DEFAULT_RECEIVE_RESPONSE_TIMEOUT 21000
+-
+-static int request_receive_response_timeout( struct request *req )
++static DWORD request_header_receive_timeout( struct request *req )
+ {
+-    if (req->receive_response_timeout == -1) return ACTUAL_DEFAULT_RECEIVE_RESPONSE_TIMEOUT;
+-    return req->receive_response_timeout;
++    if (req->receive_response_timeout_set) return req->receive_response_timeout;
++    return req->receive_timeout;
+ }
+ 
+ static const WCHAR *attribute_table[] =
+@@ -1423,7 +1421,12 @@ static DWORD secure_proxy_connect( struct request *request )
+     len = strlen( strA );
+     ret = netconn_send( request->netconn, strA, len, &bytes_sent, NULL );
+     free( strA );
+-    if (!ret) ret = read_reply( request );
++    if (!ret)
++    {
++        netconn_set_timeout( request->netconn, FALSE, request_header_receive_timeout( request ));
++        ret = read_reply( request );
++        netconn_set_timeout( request->netconn, FALSE, request->receive_timeout );
++    }
+ 
+     return ret;
+ }
+@@ -1693,7 +1695,7 @@ static DWORD open_connection( struct request *request )
+             return ret;
+         }
+         netconn_set_timeout( netconn, TRUE, request->send_timeout );
+-        netconn_set_timeout( netconn, FALSE, request_receive_response_timeout( request ));
++        netconn_set_timeout( netconn, FALSE, request->receive_timeout );
+ 
+         request->netconn = netconn;
+ 
+@@ -1731,7 +1733,7 @@ static DWORD open_connection( struct request *request )
+         TRACE("using connection %p\n", netconn);
+ 
+         netconn_set_timeout( netconn, TRUE, request->send_timeout );
+-        netconn_set_timeout( netconn, FALSE, request_receive_response_timeout( request ));
++        netconn_set_timeout( netconn, FALSE, request->receive_timeout );
+         request->netconn = netconn;
+     }
+ 
+@@ -2365,7 +2367,7 @@ static DWORD send_request( struct request *request, const WCHAR *headers, DWORD
+ 
+     if (!chunked && content_length <= optional_len)
+     {
+-        netconn_set_timeout( request->netconn, FALSE, request_receive_response_timeout( request ));
++        netconn_set_timeout( request->netconn, FALSE, request_header_receive_timeout( request ));
+         request->read_reply_status = read_reply( request );
+         if (request->state == REQUEST_RESPONSE_STATE_READ_RESPONSE_QUEUED)
+             request->state = REQUEST_RESPONSE_STATE_READ_RESPONSE_QUEUED_REPLY_RECEIVED;
+@@ -2706,7 +2709,8 @@ static DWORD read_reply( struct request *request )
+         int lenW;
+ 
+         buflen = MAX_REPLY_LEN;
+-        if (read_line( request, buffer, &buflen )) return ERROR_SUCCESS;
++        if ((ret = read_line( request, buffer, &buflen )))
++            return ret == ERROR_WINHTTP_TIMEOUT ? ret : ERROR_SUCCESS;
+         if (!*buffer) buflen = 1;
+ 
+         while (len - offset < buflen + crlf_len)
+@@ -2991,7 +2995,7 @@ static DWORD receive_response( struct request *request )
+         }
+         /* fallthrough */
+     case REQUEST_RESPONSE_STATE_READ_RESPONSE_QUEUED_REQUEST_SENT:
+-        netconn_set_timeout( request->netconn, FALSE, request_receive_response_timeout( request ));
++        netconn_set_timeout( request->netconn, FALSE, request_header_receive_timeout( request ));
+         request->read_reply_status = read_reply( request );
+         request->state = REQUEST_RESPONSE_STATE_REPLY_RECEIVED;
+         break;
+diff --git a/dlls/winhttp/tests/winhttp.c b/dlls/winhttp/tests/winhttp.c
+index f0d928c9d6fd92d480395b6b081bbf2b7985a2e7..f647077c10808486b29af1fa79c5fe856d4bf003 100644
+--- a/dlls/winhttp/tests/winhttp.c
++++ b/dlls/winhttp/tests/winhttp.c
+@@ -2863,6 +2863,166 @@ static DWORD CALLBACK server_thread(LPVOID param)
+     return 0;
+ }
+ 
++struct timeout_server_info
++{
++    HANDLE ready;
++    INTERNET_PORT port;
++    DWORD delay;
++    BOOL partial_headers;
++    BOOL stall_headers;
++};
++
++static BOOL wait_for_client_close(SOCKET socket, DWORD timeout)
++{
++    DWORD start = GetTickCount();
++
++    while (GetTickCount() - start < timeout)
++    {
++        struct timeval tv = {0, 100000};
++        fd_set read_set;
++        char buffer;
++        int ret;
++
++        FD_ZERO(&read_set);
++        FD_SET(socket, &read_set);
++        ret = select(0, &read_set, NULL, NULL, &tv);
++        if (ret > 0) return recv(socket, &buffer, 1, MSG_PEEK) <= 0;
++        if (ret < 0) return TRUE;
++    }
++    return FALSE;
++}
++
++static DWORD CALLBACK timeout_server_thread(void *param)
++{
++    struct timeout_server_info *info = param;
++    struct sockaddr_in address;
++    int address_len = sizeof(address);
++    SOCKET server, client;
++    char buffer[256];
++    WSADATA wsa_data;
++
++    WSAStartup(MAKEWORD(1, 1), &wsa_data);
++    server = socket(AF_INET, SOCK_STREAM, 0);
++    ok(server != INVALID_SOCKET, "socket failed: %u\n", WSAGetLastError());
++    if (server == INVALID_SOCKET) return 1;
++
++    memset(&address, 0, sizeof(address));
++    address.sin_family = AF_INET;
++    address.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
++    ok(!bind(server, (struct sockaddr *)&address, sizeof(address)), "bind failed: %u\n", WSAGetLastError());
++    ok(!getsockname(server, (struct sockaddr *)&address, &address_len),
++            "getsockname failed: %u\n", WSAGetLastError());
++    info->port = ntohs(address.sin_port);
++    listen(server, 1);
++    SetEvent(info->ready);
++
++    client = accept(server, NULL, NULL);
++    ok(client != INVALID_SOCKET, "accept failed: %u\n", WSAGetLastError());
++    if (client != INVALID_SOCKET && server_receive_request(client, buffer, sizeof(buffer)) > 0)
++    {
++        if (info->partial_headers)
++        {
++            static const char header[] = "HTTP/1.1 200 OK\r\nX-Test: ";
++            static const char end[] = "\r\nContent-Length: 0\r\n\r\n";
++            unsigned int i;
++
++            send(client, header, sizeof(header) - 1, 0);
++            if (info->stall_headers) wait_for_client_close(client, info->delay);
++            else for (i = 0; i < 5; ++i)
++            {
++                Sleep(info->delay);
++                if (send(client, "a", 1, 0) <= 0) break;
++            }
++            if (!info->stall_headers) send(client, end, sizeof(end) - 1, 0);
++        }
++        else if (!wait_for_client_close(client, info->delay))
++        {
++            send(client, okmsg_length0, sizeof(okmsg_length0) - 1, 0);
++        }
++    }
++
++    if (client != INVALID_SOCKET)
++    {
++        shutdown(client, SD_BOTH);
++        closesocket(client);
++    }
++    closesocket(server);
++    WSACleanup();
++    return 0;
++}
++
++static DWORD run_header_timeout_test(DWORD receive_timeout, BOOL set_response_timeout,
++                                     DWORD response_timeout, DWORD server_delay, BOOL partial_headers,
++                                     BOOL stall_headers)
++{
++    struct timeout_server_info info = {0};
++    HINTERNET session, connect, request;
++    HANDLE thread;
++    DWORD error = ERROR_SUCCESS, wait;
++    BOOL ret;
++
++    info.ready = CreateEventW(NULL, FALSE, FALSE, NULL);
++    info.delay = server_delay;
++    info.partial_headers = partial_headers;
++    info.stall_headers = stall_headers;
++    thread = CreateThread(NULL, 0, timeout_server_thread, &info, 0, NULL);
++    ok(!!thread, "CreateThread failed: %lu\n", GetLastError());
++    wait = WaitForSingleObject(info.ready, 10000);
++    ok(wait == WAIT_OBJECT_0, "server did not start: %lu\n", wait);
++
++    session = WinHttpOpen(L"winetest", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0);
++    ok(!!session, "WinHttpOpen failed: %lu\n", GetLastError());
++    set_timeout_option(session, WINHTTP_OPTION_RECEIVE_TIMEOUT, receive_timeout);
++    if (set_response_timeout)
++        set_timeout_option(session, WINHTTP_OPTION_RECEIVE_RESPONSE_TIMEOUT, response_timeout);
++    connect = WinHttpConnect(session, L"127.0.0.1", info.port, 0);
++    ok(!!connect, "WinHttpConnect failed: %lu\n", GetLastError());
++    request = WinHttpOpenRequest(connect, NULL, NULL, NULL, NULL, NULL, 0);
++    ok(!!request, "WinHttpOpenRequest failed: %lu\n", GetLastError());
++
++    ret = WinHttpSendRequest(request, NULL, 0, NULL, 0, 0, 0);
++    if (ret) ret = WinHttpReceiveResponse(request, NULL);
++    if (!ret) error = GetLastError();
++    else if (partial_headers)
++    {
++        WCHAR value[16];
++        DWORD size = sizeof(value);
++
++        ret = WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"X-Test", value, &size, NULL);
++        ok(ret, "WinHttpQueryHeaders failed: %lu\n", GetLastError());
++        if (ret) ok(!wcscmp(value, L"aaaaa"), "unexpected X-Test value %s\n", debugstr_w(value));
++    }
++
++    WinHttpCloseHandle(request);
++    WinHttpCloseHandle(connect);
++    WinHttpCloseHandle(session);
++    wait = WaitForSingleObject(thread, 10000);
++    ok(wait == WAIT_OBJECT_0, "server thread did not exit: %lu\n", wait);
++    CloseHandle(thread);
++    CloseHandle(info.ready);
++    return error;
++}
++
++static void test_receive_response_header_timeouts(void)
++{
++    DWORD error;
++
++    error = run_header_timeout_test(1000, FALSE, 0, 5000, FALSE, FALSE);
++    ok(error == ERROR_WINHTTP_TIMEOUT, "expected timeout with implicit response timeout, got %lu\n", error);
++
++    error = run_header_timeout_test(500, TRUE, 1000, 5000, FALSE, FALSE);
++    ok(error == ERROR_WINHTTP_TIMEOUT, "expected explicit response timeout, got %lu\n", error);
++
++    error = run_header_timeout_test(500, TRUE, 1000, 5000, TRUE, TRUE);
++    ok(error == ERROR_WINHTTP_TIMEOUT, "expected partial header timeout, got %lu\n", error);
++
++    error = run_header_timeout_test(500, TRUE, 8000, 5000, FALSE, FALSE);
++    ok(error == ERROR_SUCCESS, "expected delayed response success, got %lu\n", error);
++
++    error = run_header_timeout_test(500, TRUE, 1000, 600, TRUE, FALSE);
++    ok(error == ERROR_SUCCESS, "expected partial header success, got %lu\n", error);
++}
++
+ static void test_basic_request(int port, const WCHAR *verb, const WCHAR *path)
+ {
+     HINTERNET ses, con, req;
+@@ -6540,2 +6700,3 @@ START_TEST (winhttp)
+     test_receive_response_timeout_inheritance();
++    test_receive_response_header_timeouts();
+     test_resolve_timeout();
